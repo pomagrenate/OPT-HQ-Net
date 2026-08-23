@@ -310,9 +310,11 @@ class HQMaskDecoder(nn.Module):
         # Positional encoding: (N, D, 28, 28)
         pos = self.pos_enc(features_2d)
 
-        # Flatten to sequence: (N, 28*28, D)
-        N_crops, D, H_c, W_c = features_2d.shape
-        feat_seq = (features_2d + pos).flatten(2).permute(0, 2, 1)  # (N, HW, D)
+        # 2x2 Spatial pooling for Cross-Attention key/value tokens (28x28 -> 14x14 = 196 tokens)
+        # Cuts cross-attention memory and compute by 4x while keeping full 28x28 resolution for mask decoding
+        pooled_2d = F.avg_pool2d(features_2d, kernel_size=2)
+        pos_pooled = F.avg_pool2d(pos, kernel_size=2)
+        feat_seq = (pooled_2d + pos_pooled).flatten(2).permute(0, 2, 1)  # (N, 196, D)
 
         # Build prompt queries: (N, D)
         all_boxes = torch.cat(

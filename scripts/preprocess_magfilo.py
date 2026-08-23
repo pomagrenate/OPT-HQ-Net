@@ -1,0 +1,144 @@
+"""
+MAGFiLO Offline Dataset Preprocessing Script.
+
+Preprocesses high-resolution (2048×2048) MAGFiLO solar images and COCO JSON polygon
+annotations into compact 512×512 images and compressed NPZ mask files.
+
+Usage
+-----
+$ python scripts/preprocess_magfilo.py --data_root MAGFiLO_1.0_Kaggle_2026/train --output_dir magfilo_512_preprocessed --target_size 512
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+
+import cv2
+import numpy as np
+from tqdm import tqdm
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Preprocess MAGFiLO dataset into fast NPZ/Image caches.")
+    parser.add_argument("--data_root", type=str, required=True, help="Path to input dataset split directory (containing train_images/ and COCO JSON).")
+    parser.add_argument("--output_dir", type=str, default="magfilo_512_preprocessed", help="Path to save preprocessed images and masks.")
+    parser.add_argument("--target_size", type=int, default=512, help="Target spatial size (512 or 768).")
+    return parser.parse_args()
+
+
+def masks_to_oriented_boxes(masks: np.ndarray) -> np.ndarray:
+    """Compute oriented bounding boxes [xc, yc, w, h, theta_rad] from binary masks."""
+    boxes = []
+    for mask in masks:
+        ys, xs = np.where(mask > 0)
+        if len(xs) == 0:
+            boxes.append([0.0, 0.0, 1.0, 1.0, 0.0])
+            continue
+        pts = np.stack([xs, ys], axis=1).astype(np.float32)
+        (xc, yc), (w, h), angle_deg = cv2.minAreaRect(pts)
+        theta_rad = np.deg2rad(angle_deg)
+        boxes.append([float(xc), float(yc), float(w), float(h), float(theta_rad)])
+    return np.array(boxes, dtype=np.float32) if boxes else np.zeros((0, 5), dtype=np.float32)
+
+
+def main():
+    args = parse_args()
+    data_root = Path(args.data_root)
+    output_dir = Path(args.output_dir)
+    target_size = args.target_size
+
+    img_out_dir = output_dir / "images"
+    mask_out_dir = output_dir / "masks"
+    img_out_dir.mkdir(parents=True, exist_ok=True)
+    mask_out_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Locate COCO JSON
+    json_files = list(data_root.glob("*.json")) + list(data_root.rglob("*.json"))
+    coco_json = json_files[0] if json_files else None
+
+    img_id_to_anns = {}
+    if coco_json and coco_json.exists():
+        print(f"[Preprocessor] Parsing COCO annotations from: {coco_json}")
+        with open(coco_json, "r", encoding="utf-8") as f:
+            coco_data = json.load(f)
+
+        img_id_map = {str(img["id"]): (Path(img["file_name"]).stem, img.get("height", 2048), img.get("width", 2048)) for img in coco_data.get("images", [])}
+        for ann in coco_data.get("annotations", []):
+            coco_img_id = str(ann["image_id"])
+            if coco_img_id in img_id_map:
+                stem, h, w = img_id_map[coco_img_id]
+                img_id_to_anns.setdefault(stem, []).append({**ann, "_h": h, "_w": w})
+        print(f"[Preprocessor] Loaded annotations for {len(img_id_to_anns)} image stems.")
+
+    # 2. Locate image files
+    img_dir = data_root / "train_images" if (data_root / "train_images").exists() else (data_root / "images" if (data_root / "images").exists() else data_root)
+    img_paths = list(img_dir.glob("*.jpeg")) + list(img_dir.glob("*.jpg")) + list(img_dir.glob("*.png"))
+
+    print(f"[Preprocessor] Processing {len(img_paths)} images to resolution {target_size}x{target_size}...")
+
+    manifest = []
+    for img_path in tqdm(img_paths, desc="Preprocessing"):
+        stem = img_path.stem
+        # Read raw image
+        raw_img = cv2.imread(str(img_path))
+        if raw_img is None:
+            continue
+
+        orig_h, orig_w = raw_img.shape[:2]
+
+        # Resize image
+        resized_img = cv2.resize(raw_img, (target_size, target_size), interpolation=cv2.INTER_AREA)
+        cv2.imwrite(str(img_out_dir / f"{stem}.jpeg"), resized_img, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+
+        # Render masks at target resolution
+        anns = img_id_to_anns.get(stem, [])
+        masks_list = []
+        if anns:
+            scale_x = target_size / float(orig_w)
+            scale_y = target_size / float(orig_h)
+            for ann in anns:
+                seg = ann.get("segmentation")
+                mask = np.zeros((target_size, target_size), dtype=np.uint8)
+                if isinstance(seg, list):
+                    for poly in seg:
+                        pts = np.array(poly, dtype=np.float32).reshape(-1, 2)
+                        pts[:, 0] *= scale_x
+                        pts[:, 1] *= scale_y
+                        pts_int = pts.astype(np.int32)
+                        cv2.fillPoly(mask, [pts_int], 1)
+                masks_list.append(mask)
+
+        if masks_list:
+            masks_arr = np.stack(masks_list, axis=0)  # (N, target_size, target_size) uint8
+            boxes_arr = masks_to_oriented_boxes(masks_arr)
+        else:
+            masks_arr = np.zeros((0, target_size, target_size), dtype=np.uint8)
+            boxes_arr = np.zeros((0, 5), dtype=np.float32)
+
+        # Save NPZ file
+        np.savez_compressed(
+            mask_out_dir / f"{stem}.npz",
+            masks=masks_arr,
+            boxes=boxes_arr,
+        )
+
+        manifest.append({
+            "stem": stem,
+            "orig_h": orig_h,
+            "orig_w": orig_w,
+            "target_size": target_size,
+            "num_instances": len(masks_arr),
+        })
+
+    # Save manifest
+    with open(output_dir / "manifest.json", "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
+
+    print(f"\n[Preprocessor] Complete! Preprocessed {len(manifest)} items saved to: {output_dir}")
+
+
+if __name__ == "__main__":
+    main()
