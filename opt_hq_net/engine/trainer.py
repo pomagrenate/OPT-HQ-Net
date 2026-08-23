@@ -162,7 +162,8 @@ class Trainer:
             self.scheduler.step()
 
             # Validation
-            if self.val_loader is not None:
+            val_every = getattr(self.cfg, "val_every_n_epochs", 1)
+            if self.val_loader is not None and (epoch % val_every == 0):
                 val_metrics = self._validate(epoch)
                 pq = val_metrics.get("PQ", 0.0)
                 if pq > self._best_pq:

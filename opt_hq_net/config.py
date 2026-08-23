@@ -147,9 +147,11 @@ class TrainingConfig:
     # Loss weights
     loss_weights: LossWeightConfig = field(default_factory=LossWeightConfig)
 
-    # Checkpointing
+    # Checkpointing & Validation
     checkpoint_dir: str = "checkpoints"
     save_every_n_epochs: int = 5
+    val_every_n_epochs: int = 1
+    """Validation frequency in epochs (default: 1 = validate every epoch)."""
 
     # Device
     device: str = "cuda"
