@@ -191,10 +191,21 @@ def rle_string_to_binary_mask(rle_string: str, height: int = 2048, width: int = 
 
 ## 📚 References & Citations
 
-1. **MAGFiLO Dataset Paper**:
+1. **Solar Filament Segmentation Challenge 2026 (Kaggle Benchmark)**:
+```bibtex
+@misc{filament-segmentation-2026,
+    author = {Azim Ahmadzadeh and Dustin J. Kempton and Qin Li and Alexei A. Pevtsov},
+    title = {Solar Filament Segmentation Challenge 2026},
+    year = {2026},
+    howpublished = {\url{https://kaggle.com/competitions/filament-segmentation-2026}},
+    note = {Kaggle}
+}
+```
+
+2. **MAGFiLO Dataset Paper**:
    > K. A. et al., *Manually Annotated GONG Filaments from H-Alpha Observations (MAGFiLO)*, Scientific Data (2024).  
    > 🔗 [DOI: 10.1038/s41597-024-03876-y](https://doi.org/10.1038/s41597-024-03876-y)
 
-2. **Panoptic Quality Evaluation Metric**:
+3. **Panoptic Quality Evaluation Metric**:
    > Kirillov, A., He, K., Girshick, R., Rother, C., & Dollár, P. (2019). *Panoptic Segmentation*. In Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR).  
    > 🔗 [DOI: 10.1109/CVPR.2019.00963](https://doi.org/10.1109/CVPR.2019.00963)
