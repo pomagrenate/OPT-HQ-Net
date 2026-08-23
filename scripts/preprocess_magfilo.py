@@ -12,15 +12,10 @@ Usage as a Python Function
 ...     output_dir="magfilo_512_preprocessed",
 ...     target_size=512,
 ... )
-
-Usage via CLI
--------------
-$ python scripts/preprocess_magfilo.py --data_root MAGFiLO_1.0_Kaggle_2026/train --output_dir magfilo_512_preprocessed --target_size 512
 """
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
 from pathlib import Path
@@ -171,20 +166,3 @@ def preprocess_magfilo_dataset(
 
     print(f"\n[Preprocessor] Complete! Preprocessed {len(manifest)} items saved to: {output_dir}")
     return output_dir
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(description="Preprocess MAGFiLO dataset into fast NPZ/Image caches.")
-    parser.add_argument("--data_root", type=str, required=True, help="Path to input dataset split directory.")
-    parser.add_argument("--output_dir", type=str, default="magfilo_512_preprocessed", help="Path to save output.")
-    parser.add_argument("--target_size", type=int, default=512, help="Target spatial size (512 or 768).")
-    return parser.parse_args()
-
-
-if __name__ == "__main__":
-    args = parse_args()
-    preprocess_magfilo_dataset(
-        data_root=args.data_root,
-        output_dir=args.output_dir,
-        target_size=args.target_size,
-    )
