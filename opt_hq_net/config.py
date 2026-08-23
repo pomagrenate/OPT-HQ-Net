@@ -40,10 +40,10 @@ class OrientedRPNConfig:
     """Aspect ratios w/h."""
     anchor_angles: List[float] = field(default_factory=lambda: [0, 45, 90, 135])
     """Anchor angles in degrees (12 total anchors per location instead of 150)."""
-    pre_nms_top_n_train: int = 1000
-    pre_nms_top_n_test: int = 500
-    post_nms_top_n_train: int = 300
-    post_nms_top_n_test: int = 200
+    pre_nms_top_n_train: int = 500
+    pre_nms_top_n_test: int = 300
+    post_nms_top_n_train: int = 100
+    post_nms_top_n_test: int = 100
     nms_iou_threshold: float = 0.7
     """Threshold for axis-aligned NMS during proposal filtering."""
     fg_iou_threshold: float = 0.5

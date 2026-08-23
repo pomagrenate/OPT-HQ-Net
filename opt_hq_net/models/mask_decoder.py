@@ -333,9 +333,20 @@ class HQMaskDecoder(nn.Module):
         # Query sequence: [prompt_token, hq_token] → (N, 2, D)
         queries = torch.stack([prompt_embs, hq_token], dim=1)
 
-        # Run transformer decoder layers
-        for layer in self.decoder_layers:
-            queries = layer(queries, feat_seq, feat_seq)
+        # Run transformer decoder layers in chunks of 64 to prevent MultiheadAttention OOM
+        if N > 64:
+            queries_out = []
+            chunk_size = 64
+            for start in range(0, N, chunk_size):
+                q_chunk = queries[start:start + chunk_size]
+                f_chunk = feat_seq[start:start + chunk_size]
+                for layer in self.decoder_layers:
+                    q_chunk = layer(q_chunk, f_chunk, f_chunk)
+                queries_out.append(q_chunk)
+            queries = torch.cat(queries_out, dim=0)
+        else:
+            for layer in self.decoder_layers:
+                queries = layer(queries, feat_seq, feat_seq)
 
         # Use HQ token output (index 1) for the final mask prediction
         hq_out = queries[:, 1, :]   # (N, D)

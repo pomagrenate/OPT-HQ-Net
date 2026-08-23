@@ -388,8 +388,8 @@ class OrientedRPN(nn.Module):
             boxes = self.box_coder.decode(anchors, delta_flat[i])  # (N, 5)
             s = scores[i]                                            # (N,)
 
-            # Top-K by score
-            top_n = self.cfg.pre_nms_top_n_train if self.training else self.cfg.pre_nms_top_n_test
+            # Top-K by score (limit to post_nms_top_n_train during training to prevent VRAM spikes)
+            top_n = self.cfg.post_nms_top_n_train if self.training else self.cfg.post_nms_top_n_test
             k = min(top_n, len(s))
             top_idx = s.topk(k).indices
             boxes, s = boxes[top_idx], s[top_idx]
