@@ -1,6 +1,6 @@
 # Datasets
 MAGFiLO_1.0_Kaggle_2026/
-data/
+/data/
 *.fits
 *.h5
 
