@@ -150,8 +150,11 @@ class SolarFilamentDataset(Dataset):
 
     def _find_coco_json(self) -> Optional[Path]:
         """Look for COCO format JSON annotations file in data_root or parent directories."""
-        # 1. Search in data_root directly and recursively
-        json_files = list(self.data_root.glob("*.json")) + list(self.data_root.rglob("*.json"))
+        # 1. Search in data_root directly and recursively (exclude non-COCO manifest.json)
+        json_files = [
+            j for j in (list(self.data_root.glob("*.json")) + list(self.data_root.rglob("*.json")))
+            if j.name.lower() != "manifest.json"
+        ]
         if json_files:
             return json_files[0]
 
@@ -159,7 +162,10 @@ class SolarFilamentDataset(Dataset):
         curr = self.data_root.parent
         for _ in range(3):
             if curr and curr.exists():
-                parent_jsons = list(curr.glob("*.json")) + list(curr.rglob("*.json"))
+                parent_jsons = [
+                    j for j in (list(curr.glob("*.json")) + list(curr.rglob("*.json")))
+                    if j.name.lower() != "manifest.json"
+                ]
                 if parent_jsons:
                     return parent_jsons[0]
                 curr = curr.parent
@@ -172,6 +178,10 @@ class SolarFilamentDataset(Dataset):
         print(f"[Dataset] Loading COCO annotations from: {self.coco_json}")
         with open(self.coco_json, "r", encoding="utf-8") as f:
             data = json.load(f)
+
+        if not isinstance(data, dict):
+            print(f"[Dataset] Skipping non-COCO format JSON file: {self.coco_json}")
+            return
 
         # Build image_filename/stem -> COCO img_id (use str to handle int/str ID types)
         img_id_map = {}
