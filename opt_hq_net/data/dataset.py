@@ -91,7 +91,7 @@ class SolarFilamentDataset(Dataset):
                 if not cache_masks.exists() or not any(cache_masks.glob("*.npz")):
                     print(f"\n[Dataset] Auto-Preprocessing: Building pre-rendered NPZ cache for '{self.data_root.name}'...")
                     try:
-                        from scripts.preprocess_magfilo import preprocess_magfilo_dataset
+                        from .preprocess import preprocess_magfilo_dataset
                         preprocess_magfilo_dataset(
                             data_root=self.data_root,
                             output_dir=cache_dir,

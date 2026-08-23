@@ -3,6 +3,7 @@
 from opt_hq_net.data.preprocessing import CLAHEPreprocessor, SolarDiskMask
 from opt_hq_net.data.augmentation import SolarAugmentation
 from opt_hq_net.data.dataset import SolarFilamentDataset, collate_fn
+from opt_hq_net.data.preprocess import preprocess_magfilo_dataset
 
 __all__ = [
     "CLAHEPreprocessor",
@@ -10,4 +11,5 @@ __all__ = [
     "SolarAugmentation",
     "SolarFilamentDataset",
     "collate_fn",
+    "preprocess_magfilo_dataset",
 ]
