@@ -47,8 +47,8 @@ def parse_args() -> argparse.Namespace:
     # Data
     parser.add_argument("--data_root", type=str, required=True,
                         help="Root directory containing 'images/' and 'masks/' subdirs.")
-    parser.add_argument("--target_size", type=int, default=1024,
-                        help="Image size for training crops (default: 1024).")
+    parser.add_argument("--target_size", type=int, default=512,
+                        help="Image size for training crops (default: 512).")
     parser.add_argument("--num_workers", type=int, default=4)
 
     # Model

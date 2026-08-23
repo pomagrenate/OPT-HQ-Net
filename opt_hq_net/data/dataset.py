@@ -75,11 +75,34 @@ class SolarFilamentDataset(Dataset):
         augment: bool = True,
         clahe_clip_limit: float = 2.0,
         image_extensions: Optional[List[str]] = None,
-        target_size: int = 1024,
+        target_size: int = 512,
+        auto_preprocess: bool = True,
     ) -> None:
         self.data_root = Path(data_root)
         self.augment = augment
         self.target_size = target_size
+
+        # ── Automatic transparent preprocessing check ────────────────────────
+        if auto_preprocess:
+            is_already_preprocessed = (self.data_root / "masks").exists() and any((self.data_root / "masks").glob("*.npz"))
+            if not is_already_preprocessed:
+                cache_dir = Path("magfilo_cache") / f"{self.data_root.name}_{target_size}"
+                cache_masks = cache_dir / "masks"
+                if not cache_masks.exists() or not any(cache_masks.glob("*.npz")):
+                    print(f"\n[Dataset] Auto-Preprocessing: Building pre-rendered NPZ cache for '{self.data_root.name}'...")
+                    try:
+                        from scripts.preprocess_magfilo import preprocess_magfilo_dataset
+                        preprocess_magfilo_dataset(
+                            data_root=self.data_root,
+                            output_dir=cache_dir,
+                            target_size=target_size,
+                            show_progress=True,
+                        )
+                    except Exception as err:
+                        print(f"[Dataset WARNING] Auto-preprocessing skipped: {err}. Falling back to dynamic parsing.")
+
+                if (cache_dir / "masks").exists() and any((cache_dir / "masks").glob("*.npz")):
+                    self.data_root = cache_dir
 
         # Flexible image directory resolution (images/, train_images/, test_images/, or data_root)
         if (self.data_root / "images").exists():
