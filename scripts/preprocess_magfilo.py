@@ -1,11 +1,20 @@
 """
-MAGFiLO Offline Dataset Preprocessing Script.
+MAGFiLO Offline Dataset Preprocessing Module.
 
 Preprocesses high-resolution (2048×2048) MAGFiLO solar images and COCO JSON polygon
 annotations into compact 512×512 images and compressed NPZ mask files.
 
-Usage
------
+Usage as a Python Function
+--------------------------
+>>> from scripts.preprocess_magfilo import preprocess_magfilo_dataset
+>>> output_dir = preprocess_magfilo_dataset(
+...     data_root="MAGFiLO_1.0_Kaggle_2026/train",
+...     output_dir="magfilo_512_preprocessed",
+...     target_size=512,
+... )
+
+Usage via CLI
+-------------
 $ python scripts/preprocess_magfilo.py --data_root MAGFiLO_1.0_Kaggle_2026/train --output_dir magfilo_512_preprocessed --target_size 512
 """
 
@@ -15,18 +24,11 @@ import argparse
 import json
 import os
 from pathlib import Path
+from typing import Union
 
 import cv2
 import numpy as np
 from tqdm import tqdm
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(description="Preprocess MAGFiLO dataset into fast NPZ/Image caches.")
-    parser.add_argument("--data_root", type=str, required=True, help="Path to input dataset split directory (containing train_images/ and COCO JSON).")
-    parser.add_argument("--output_dir", type=str, default="magfilo_512_preprocessed", help="Path to save preprocessed images and masks.")
-    parser.add_argument("--target_size", type=int, default=512, help="Target spatial size (512 or 768).")
-    return parser.parse_args()
 
 
 def masks_to_oriented_boxes(masks: np.ndarray) -> np.ndarray:
@@ -44,11 +46,33 @@ def masks_to_oriented_boxes(masks: np.ndarray) -> np.ndarray:
     return np.array(boxes, dtype=np.float32) if boxes else np.zeros((0, 5), dtype=np.float32)
 
 
-def main():
-    args = parse_args()
-    data_root = Path(args.data_root)
-    output_dir = Path(args.output_dir)
-    target_size = args.target_size
+def preprocess_magfilo_dataset(
+    data_root: Union[str, Path],
+    output_dir: Union[str, Path],
+    target_size: int = 512,
+    show_progress: bool = True,
+) -> Path:
+    """
+    Preprocess raw MAGFiLO dataset into downsampled images and compressed NPZ mask files.
+
+    Parameters
+    ----------
+    data_root : str | Path
+        Path to raw split directory containing 'train_images/' and/or COCO JSON.
+    output_dir : str | Path
+        Target directory to save preprocessed 'images/' and 'masks/' NPZ files.
+    target_size : int, optional
+        Target spatial size (512 or 768). Default is 512.
+    show_progress : bool, optional
+        Whether to display tqdm progress bar. Default is True.
+
+    Returns
+    -------
+    Path
+        Path object pointing to output_dir.
+    """
+    data_root = Path(data_root)
+    output_dir = Path(output_dir)
 
     img_out_dir = output_dir / "images"
     mask_out_dir = output_dir / "masks"
@@ -65,7 +89,10 @@ def main():
         with open(coco_json, "r", encoding="utf-8") as f:
             coco_data = json.load(f)
 
-        img_id_map = {str(img["id"]): (Path(img["file_name"]).stem, img.get("height", 2048), img.get("width", 2048)) for img in coco_data.get("images", [])}
+        img_id_map = {
+            str(img["id"]): (Path(img["file_name"]).stem, img.get("height", 2048), img.get("width", 2048))
+            for img in coco_data.get("images", [])
+        }
         for ann in coco_data.get("annotations", []):
             coco_img_id = str(ann["image_id"])
             if coco_img_id in img_id_map:
@@ -74,13 +101,18 @@ def main():
         print(f"[Preprocessor] Loaded annotations for {len(img_id_to_anns)} image stems.")
 
     # 2. Locate image files
-    img_dir = data_root / "train_images" if (data_root / "train_images").exists() else (data_root / "images" if (data_root / "images").exists() else data_root)
+    img_dir = (
+        data_root / "train_images"
+        if (data_root / "train_images").exists()
+        else (data_root / "images" if (data_root / "images").exists() else data_root)
+    )
     img_paths = list(img_dir.glob("*.jpeg")) + list(img_dir.glob("*.jpg")) + list(img_dir.glob("*.png"))
 
     print(f"[Preprocessor] Processing {len(img_paths)} images to resolution {target_size}x{target_size}...")
 
     manifest = []
-    for img_path in tqdm(img_paths, desc="Preprocessing"):
+    pbar = tqdm(img_paths, desc="Preprocessing", disable=not show_progress)
+    for img_path in pbar:
         stem = img_path.stem
         # Read raw image
         raw_img = cv2.imread(str(img_path))
@@ -138,7 +170,21 @@ def main():
         json.dump(manifest, f, indent=2)
 
     print(f"\n[Preprocessor] Complete! Preprocessed {len(manifest)} items saved to: {output_dir}")
+    return output_dir
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Preprocess MAGFiLO dataset into fast NPZ/Image caches.")
+    parser.add_argument("--data_root", type=str, required=True, help="Path to input dataset split directory.")
+    parser.add_argument("--output_dir", type=str, default="magfilo_512_preprocessed", help="Path to save output.")
+    parser.add_argument("--target_size", type=int, default=512, help="Target spatial size (512 or 768).")
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    preprocess_magfilo_dataset(
+        data_root=args.data_root,
+        output_dir=args.output_dir,
+        target_size=args.target_size,
+    )
