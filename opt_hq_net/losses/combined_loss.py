@@ -175,7 +175,8 @@ class OPTHQNetLoss(nn.Module):
         used_pred = set()
         for g in range(G):
             best_pred = int(iou_np[:, g].argmax())
-            if best_pred not in used_pred and iou_np[best_pred, g] >= 0.3:
+            # Match best proposal per GT box (threshold relaxed to 0.05 to ensure early training gradients)
+            if best_pred not in used_pred and iou_np[best_pred, g] >= 0.05:
                 matched.append((best_pred, g))
                 used_pred.add(best_pred)
 

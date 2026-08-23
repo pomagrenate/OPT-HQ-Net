@@ -389,13 +389,15 @@ class OrientedRPN(nn.Module):
             s = scores[i]                                            # (N,)
 
             # Top-K by score
-            k = min(self.cfg.pre_nms_top_n_test, len(s))
+            top_n = self.cfg.pre_nms_top_n_train if self.training else self.cfg.pre_nms_top_n_test
+            k = min(top_n, len(s))
             top_idx = s.topk(k).indices
             boxes, s = boxes[top_idx], s[top_idx]
 
-            # Threshold
-            keep = s >= 0.05
-            boxes, s = boxes[keep], s[keep]
+            # Threshold (only filter during eval/inference; keep top proposals during training)
+            if not self.training:
+                keep = s >= 0.05
+                boxes, s = boxes[keep], s[keep]
 
             # Concatenate score as 6th column
             result = torch.cat([boxes, s.unsqueeze(-1)], dim=-1)
