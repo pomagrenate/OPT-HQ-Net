@@ -247,10 +247,20 @@ class SolarFilamentDataset(Dataset):
         """
         h, w = image_shape
 
-        if not self.has_masks:
-            return np.zeros((0, h, w), dtype=np.uint8), np.zeros((0, 5), dtype=np.float32)
+        # Priority 1: Pre-rendered NPZ masks & pre-calculated boxes (Fastest)
+        mask_path = self.mask_dir / f"{image_id}.npz"
+        if not mask_path.exists():
+            mask_path = self.data_root / "masks" / f"{image_id}.npz"
+        if mask_path.exists():
+            data = np.load(str(mask_path), allow_pickle=False)
+            masks = data["masks"].astype(np.uint8)   # (N, H, W)
+            if "boxes" in data and len(data["boxes"]) == len(masks):
+                boxes = data["boxes"].astype(np.float32)
+            else:
+                boxes = self._masks_to_oriented_boxes(masks)
+            return masks, boxes
 
-        # Priority 1: COCO JSON annotations
+        # Priority 2: On-the-fly COCO JSON parsing
         if image_id in self.img_id_to_anns:
             anns = self.img_id_to_anns[image_id]
             masks_list = []
@@ -258,12 +268,10 @@ class SolarFilamentDataset(Dataset):
                 seg = ann.get("segmentation")
                 mask = np.zeros((h, w), dtype=np.uint8)
                 if isinstance(seg, list):
-                    # Polygon coordinates [[x1, y1, x2, y2, ...]]
                     for poly in seg:
                         pts = np.array(poly, dtype=np.int32).reshape(-1, 2)
                         cv2.fillPoly(mask, [pts], 1)
                 elif isinstance(seg, dict):
-                    # RLE dict
                     try:
                         from pycocotools import mask as coco_mask
                         rle = coco_mask.frPyObjects(seg, ann["_h"], ann["_w"])
@@ -278,14 +286,6 @@ class SolarFilamentDataset(Dataset):
                 masks = np.stack(masks_list, axis=0)  # (N, H, W)
                 boxes = self._masks_to_oriented_boxes(masks)
                 return masks, boxes
-
-        # Priority 2: NPZ masks
-        mask_path = self.mask_dir / f"{image_id}.npz"
-        if mask_path.exists():
-            data = np.load(str(mask_path), allow_pickle=False)
-            masks = data["masks"].astype(np.uint8)   # (N, H, W)
-            boxes = self._masks_to_oriented_boxes(masks)
-            return masks, boxes
 
         return np.zeros((0, h, w), dtype=np.uint8), np.zeros((0, 5), dtype=np.float32)
 
