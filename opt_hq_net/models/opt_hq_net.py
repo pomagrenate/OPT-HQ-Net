@@ -135,8 +135,8 @@ class OPTHQNet(nn.Module):
         mask_logits = self.decoder(roi_crops, proposals, p2, batch_idx)
         # mask_logits: (N_total, 1, 112, 112)
 
-        # Upsample to target resolution
-        if mask_logits.shape[0] > 0 and self.target_mask_size != 112:
+        # Upsample to target resolution during inference/evaluation only
+        if not self.training and mask_logits.shape[0] > 0 and self.target_mask_size != 112:
             mask_logits = F.interpolate(
                 mask_logits,
                 size=(self.target_mask_size, self.target_mask_size),
@@ -144,10 +144,7 @@ class OPTHQNet(nn.Module):
                 align_corners=False,
             )
 
-        # ── 5. Package per-image predictions ──────────────────────────
-        predictions = self._assemble_predictions(proposals, mask_logits, batch_idx, images.shape[0])
-
-        # ── 6. Compute losses (training only) ─────────────────────────
+        # ── 5. Compute losses (training only) ─────────────────────────
         if self.training and gt_boxes is not None and gt_masks is not None:
             mask_losses = self.loss_fn(
                 mask_logits=mask_logits,
@@ -159,8 +156,10 @@ class OPTHQNet(nn.Module):
             )
             loss_dict = {**rpn_losses, **mask_losses}
             loss_dict["total_loss"] = sum(loss_dict.values())
-            return predictions, loss_dict
+            return [], loss_dict
 
+        # ── 6. Package per-image predictions (inference only) ─────────
+        predictions = self._assemble_predictions(proposals, mask_logits, batch_idx, images.shape[0])
         return predictions, {}
 
     # ------------------------------------------------------------------

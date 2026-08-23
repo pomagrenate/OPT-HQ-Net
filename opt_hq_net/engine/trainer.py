@@ -151,6 +151,11 @@ class Trainer:
     # ------------------------------------------------------------------
     def train(self) -> None:
         """Run the full training loop for ``cfg.num_epochs`` epochs."""
+        import gc
+        gc.collect()
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+
         print(f"[Trainer] Starting training on device: {self.device}")
         print(f"[Trainer] AMP enabled: {self.use_amp}")
         print(f"[Trainer] Multi-GPU active: {self.num_gpus > 1} ({self.num_gpus} GPUs)")
