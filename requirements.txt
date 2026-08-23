@@ -1,0 +1,36 @@
+# OPT-HQ Net: Core runtime dependencies
+# Install with: pip install -r requirements.txt
+
+# Deep learning framework
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Pretrained backbone models (ConvNeXt-L, Swin-L)
+timm>=0.9.0
+
+# COCO-format RLE encoding
+pycocotools>=2.0.6
+
+# Image processing
+opencv-python-headless>=4.7.0
+scikit-image>=0.20.0     # morphological skeletonize for SkeletonRecallLoss
+
+# Polygon IoU for Rotated NMS
+shapely>=2.0.0
+
+# Data & numerics
+numpy>=1.24.0
+scipy>=1.10.0
+pandas>=2.0.0
+
+# Optional: FITS image loading
+# astropy>=5.3.0
+
+# Optional: Progress bars
+# tqdm>=4.65.0
+
+# Optional: Experiment tracking
+# wandb>=0.15.0
+
+# Optional: Visualisation
+matplotlib>=3.7.0

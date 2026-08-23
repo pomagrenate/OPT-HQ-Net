@@ -1,0 +1,39 @@
+# Datasets
+MAGFiLO_1.0_Kaggle_2026/
+data/
+*.fits
+*.h5
+
+# Model Checkpoints & Weights
+checkpoints/
+*.pth
+*.pt
+*.onnx
+*.safetensors
+*.bin
+*.pkl
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Environment & IDE
+.venv/
+venv/
+ENV/
+.env
+.idea/
+.vscode/
+.ipynb_checkpoints/
+
+# Runs & Outputs
+runs/
+logs/
+*.csv
+submission.csv
+*.log
+!README.md
+!TODO.md
