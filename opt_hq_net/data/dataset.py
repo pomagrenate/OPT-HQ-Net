@@ -120,9 +120,13 @@ class SolarFilamentDataset(Dataset):
         else:
             self.image_dir = self.data_root
 
-        # Check for COCO JSON annotations or masks/ folder
-        self.coco_json = self._find_coco_json()
+        # Check for COCO JSON annotations or pre-rendered masks/ folder
         self.mask_dir = self.data_root / "masks"
+        if self.mask_dir.exists() and any(self.mask_dir.glob("*.npz")):
+            self.coco_json = None
+        else:
+            self.coco_json = self._find_coco_json()
+
         self.has_masks = (self.coco_json is not None) or self.mask_dir.exists()
 
         exts = image_extensions or [".png", ".jpg", ".jpeg", ".fits"]
