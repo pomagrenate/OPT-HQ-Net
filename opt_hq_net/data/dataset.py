@@ -91,13 +91,27 @@ class SolarFilamentDataset(Dataset):
                 if not cache_masks.exists() or not any(cache_masks.glob("*.npz")):
                     print(f"\n[Dataset] Auto-Preprocessing: Building pre-rendered NPZ cache for '{self.data_root.name}'...")
                     try:
-                        from .preprocess import preprocess_magfilo_dataset
-                        preprocess_magfilo_dataset(
-                            data_root=self.data_root,
-                            output_dir=cache_dir,
-                            target_size=target_size,
-                            show_progress=True,
-                        )
+                        preprocess_fn = None
+                        try:
+                            from opt_hq_net.data.preprocess import preprocess_magfilo_dataset as preprocess_fn
+                        except (ImportError, ValueError):
+                            try:
+                                from .preprocess import preprocess_magfilo_dataset as preprocess_fn
+                            except (ImportError, ValueError):
+                                try:
+                                    from preprocess import preprocess_magfilo_dataset as preprocess_fn
+                                except (ImportError, ValueError):
+                                    pass
+
+                        if preprocess_fn is not None:
+                            preprocess_fn(
+                                data_root=self.data_root,
+                                output_dir=cache_dir,
+                                target_size=target_size,
+                                show_progress=True,
+                            )
+                        else:
+                            raise ImportError("Could not locate preprocess_magfilo_dataset module.")
                     except Exception as err:
                         print(f"[Dataset WARNING] Auto-preprocessing skipped: {err}. Falling back to dynamic parsing.")
 
