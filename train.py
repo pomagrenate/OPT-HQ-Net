@@ -67,6 +67,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints")
     parser.add_argument("--no_amp", action="store_true", help="Disable AMP.")
+    parser.add_argument("--no_grad_ckpt", action="store_true", help="Disable gradient checkpointing for max speed if VRAM permits.")
+    parser.add_argument("--val_subset", type=int, default=0, help="Validate on first N images for rapid debugging (0 = full validation).")
+    parser.add_argument("--score_thresh", type=float, default=0.01, help="Minimum proposal score during validation.")
 
     # Loss weights
     parser.add_argument("--lambda_box",      type=float, default=1.0)
@@ -89,6 +92,7 @@ def main() -> None:
         backbone_name=args.backbone,
         backbone_pretrained=not args.no_pretrained,
     )
+    model_cfg.rpn.score_threshold = args.score_thresh
 
     train_cfg = TrainingConfig(
         num_epochs=args.epochs,
@@ -100,6 +104,8 @@ def main() -> None:
         use_amp=not args.no_amp,
         checkpoint_dir=args.checkpoint_dir,
         device=args.device,
+        grad_checkpointing=not args.no_grad_ckpt,
+        val_subset=args.val_subset,
     )
     train_cfg.loss_weights.oriented_box = args.lambda_box
     train_cfg.loss_weights.focal        = args.lambda_focal
@@ -163,21 +169,29 @@ def main() -> None:
         val_ds = torch.utils.data.Subset(full_val_ds, val_indices)
         print(f"[Main] Auto Validation Split created: {train_size} train images | {val_size} val images (80/20 split)")
 
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=train_cfg.batch_size,
-        shuffle=True,
-        num_workers=train_cfg.num_workers,
-        collate_fn=collate_fn,
-        pin_memory=(args.device == "cuda"),
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=1,
-        shuffle=False,
-        num_workers=train_cfg.num_workers,
-        collate_fn=collate_fn,
-    )
+    train_loader_kwargs = {
+        "batch_size": train_cfg.batch_size,
+        "shuffle": True,
+        "num_workers": train_cfg.num_workers,
+        "collate_fn": collate_fn,
+        "pin_memory": (args.device == "cuda"),
+    }
+    val_loader_kwargs = {
+        "batch_size": 1,
+        "shuffle": False,
+        "num_workers": train_cfg.num_workers,
+        "collate_fn": collate_fn,
+        "pin_memory": (args.device == "cuda"),
+    }
+
+    if train_cfg.num_workers > 0:
+        train_loader_kwargs["persistent_workers"] = True
+        train_loader_kwargs["prefetch_factor"] = 2
+        val_loader_kwargs["persistent_workers"] = True
+        val_loader_kwargs["prefetch_factor"] = 2
+
+    train_loader = DataLoader(train_ds, **train_loader_kwargs)
+    val_loader = DataLoader(val_ds, **val_loader_kwargs)
 
     print(f"[Main] Train: {len(train_ds)} images | Val: {len(val_ds)} images")
 

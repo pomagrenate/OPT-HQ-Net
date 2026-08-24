@@ -93,6 +93,8 @@ class Trainer:
             self.device = torch.device("cpu")
 
         self.model.to(self.device)
+        if self.device.type == "cuda":
+            torch.backends.cudnn.benchmark = True
 
         # Multi-GPU support (DataParallel) — disabled by default to avoid list target scattering bugs
         self.num_gpus = torch.cuda.device_count() if self.device.type == "cuda" else 0
@@ -103,6 +105,12 @@ class Trainer:
         else:
             print(f"[Trainer] Single GPU execution on device: {self.device} (VRAM efficient mode)")
             self.is_multi_gpu = False
+
+        # Configure gradient checkpointing on backbone
+        raw_model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+        if hasattr(raw_model, "backbone") and hasattr(raw_model.backbone, "set_grad_checkpointing"):
+            enable_gc = getattr(cfg, "grad_checkpointing", True)
+            raw_model.backbone.set_grad_checkpointing(enable_gc)
 
         # Optimiser
         raw_model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
@@ -266,7 +274,7 @@ class Trainer:
     # ------------------------------------------------------------------
     @torch.no_grad()
     def _validate(self, epoch: int) -> Dict[str, float]:
-        """Validation loop — computes PQ on the validation set."""
+        """Validation loop — computes PQ on the validation set with verbose diagnostics."""
         self.model.eval()
         self.metric.reset()
 
@@ -276,6 +284,8 @@ class Trainer:
         except ImportError:
             has_tqdm = False
 
+        val_subset = getattr(self.cfg, "val_subset", 0)
+
         pbar = tqdm(
             self.val_loader,
             desc=f"Epoch {epoch:03d}/{self.cfg.num_epochs:03d} [Val  ]",
@@ -283,26 +293,62 @@ class Trainer:
             disable=not has_tqdm,
         )
 
-        for batch in pbar:
+        total_gt_instances = 0
+        total_pred_instances = 0
+        total_gt_pixels = 0
+        total_pred_pixels = 0
+
+        for step, batch in enumerate(pbar):
+            if val_subset > 0 and step >= val_subset:
+                break
+
             images = batch["images"].to(self.device)
             gt_masks_list = batch["masks"]   # list of Tensors
 
             predictions, _ = self.model(images)
 
             # Convert to numpy for metric computation
-            pred_np = [
-                (p["masks"] > 0.5).cpu().numpy().astype("uint8")
-                if len(p["masks"]) > 0 else __import__("numpy").zeros((0, 1, 1), dtype="uint8")
-                for p in predictions
-            ]
-            gt_np = [
-                m.cpu().numpy().astype("uint8")
-                for m in gt_masks_list
-            ]
+            pred_np = []
+            for p in predictions:
+                masks = p["masks"]
+                if len(masks) > 0:
+                    bin_masks = (masks > 0.5).cpu().numpy().astype("uint8")
+                    pred_np.append(bin_masks)
+                    total_pred_instances += len(bin_masks)
+                    total_pred_pixels += int(bin_masks.sum())
+                else:
+                    pred_np.append(__import__("numpy").zeros((0, 1, 1), dtype="uint8"))
+
+            gt_np = []
+            for m in gt_masks_list:
+                m_np = m.cpu().numpy().astype("uint8")
+                gt_np.append(m_np)
+                total_gt_instances += len(m_np)
+                total_gt_pixels += int(m_np.sum())
 
             self.metric.update(pred_np, gt_np)
 
-        return self.metric.compute()
+            # Diagnostic log for first few validation batches
+            if step < 3 or (step + 1) == len(self.val_loader):
+                batch_pred = sum(len(p) for p in pred_np)
+                batch_gt = sum(len(g) for g in gt_np)
+                scores_list = [p["scores"] for p in predictions if len(p["scores"]) > 0]
+                max_score = float(torch.cat(scores_list).max()) if scores_list and len(torch.cat(scores_list)) > 0 else 0.0
+                print(
+                    f"\n  [Val Debug Step {step+1:03d}] GT Instances: {batch_gt} | "
+                    f"Pred Instances: {batch_pred} (Max Score: {max_score:.4f}) | "
+                    f"Pred FG Pixels: {sum(p.sum() for p in pred_np)} | GT FG Pixels: {sum(g.sum() for g in gt_np)}"
+                )
+
+        metrics = self.metric.compute()
+        print(
+            f"  [Val Overview] GT Instances: {total_gt_instances} | "
+            f"Pred Instances: {total_pred_instances} | "
+            f"TP: {metrics.get('TP', 0)} | FP: {metrics.get('FP', 0)} | FN: {metrics.get('FN', 0)} | "
+            f"Mean Dice: {metrics.get('mean_dice', 0.0):.4f} | PQ: {metrics.get('PQ', 0.0):.4f}"
+        )
+
+        return metrics
 
     # ------------------------------------------------------------------
     def _save_checkpoint(self, epoch: int, tag: str = "epoch") -> None:

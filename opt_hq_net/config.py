@@ -46,6 +46,8 @@ class OrientedRPNConfig:
     post_nms_top_n_test: int = 100
     nms_iou_threshold: float = 0.7
     """Threshold for axis-aligned NMS during proposal filtering."""
+    score_threshold: float = 0.01
+    """Minimum proposal score during evaluation."""
     fg_iou_threshold: float = 0.5
     bg_iou_threshold: float = 0.3
     batch_size_per_image: int = 256
@@ -137,6 +139,8 @@ class TrainingConfig:
     """Automatic Mixed Precision (FP16)."""
     use_multi_gpu: bool = False
     """Enable nn.DataParallel across multiple GPUs. Default False for maximum speed with list targets."""
+    grad_checkpointing: bool = True
+    """Enable gradient checkpointing on backbone to save VRAM."""
 
     # Augmentation
     aug_min_scale: float = 0.8
@@ -152,6 +156,8 @@ class TrainingConfig:
     save_every_n_epochs: int = 5
     val_every_n_epochs: int = 1
     """Validation frequency in epochs (default: 1 = validate every epoch)."""
+    val_subset: int = 0
+    """Limit validation to first N images for rapid debugging (0 = full validation)."""
 
     # Device
     device: str = "cuda"

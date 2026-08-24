@@ -394,10 +394,17 @@ class OrientedRPN(nn.Module):
             top_idx = s.topk(k).indices
             boxes, s = boxes[top_idx], s[top_idx]
 
-            # Threshold (only filter during eval/inference; keep top proposals during training)
+            # Score thresholding during eval: apply threshold if score >= score_thresh,
+            # but fallback to top proposals if threshold removes all candidates in early training
             if not self.training:
-                keep = s >= 0.05
-                boxes, s = boxes[keep], s[keep]
+                score_thresh = getattr(self.cfg, "score_threshold", 0.01)
+                keep = s >= score_thresh
+                if keep.any():
+                    boxes, s = boxes[keep], s[keep]
+                else:
+                    # Fallback: preserve top proposals so mask decoder receives candidate proposals
+                    fallback_k = min(10, len(s))
+                    boxes, s = boxes[:fallback_k], s[:fallback_k]
 
             # Concatenate score as 6th column
             result = torch.cat([boxes, s.unsqueeze(-1)], dim=-1)
