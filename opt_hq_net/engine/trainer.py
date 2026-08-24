@@ -99,8 +99,10 @@ class Trainer:
         if self.num_gpus > 1 and getattr(cfg, "use_multi_gpu", False):
             print(f"[Trainer] Multi-GPU setup detected: {self.num_gpus} GPUs available. Enabling nn.DataParallel!")
             self.model = nn.DataParallel(self.model)
+            self.is_multi_gpu = True
         else:
             print(f"[Trainer] Single GPU execution on device: {self.device} (VRAM efficient mode)")
+            self.is_multi_gpu = False
 
         # Optimiser
         raw_model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
@@ -158,7 +160,7 @@ class Trainer:
 
         print(f"[Trainer] Starting training on device: {self.device}")
         print(f"[Trainer] AMP enabled: {self.use_amp}")
-        print(f"[Trainer] Multi-GPU active: {self.num_gpus > 1} ({self.num_gpus} GPUs)")
+        print(f"[Trainer] Multi-GPU active: {self.is_multi_gpu} ({self.num_gpus} GPUs detected)")
         print(f"[Trainer] Epochs: {self.cfg.num_epochs}")
         print(f"[Trainer] Batch size: {self.cfg.batch_size} (Grad Accum Steps: {getattr(self.cfg, 'gradient_accumulation_steps', 1)})")
 

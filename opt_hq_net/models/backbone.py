@@ -216,6 +216,12 @@ class BackboneFactory:
 
     # Alias map for user-friendly short names
     _ALIASES: Dict[str, str] = {
+        "convnext_tiny": "convnext_tiny",
+        "convnext-tiny": "convnext_tiny",
+        "convnext_small": "convnext_small",
+        "convnext-small": "convnext_small",
+        "convnext_base": "convnext_base",
+        "convnext-base": "convnext_base",
         "convnext_large": "convnext_large",
         "convnext-large": "convnext_large",
         "swin_large": "swin_large_patch4_window7_224",

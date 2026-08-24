@@ -91,13 +91,7 @@ class SolarFilamentDataset(Dataset):
                 if not cache_masks.exists() or not any(cache_masks.glob("*.npz")):
                     print(f"\n[Dataset] Auto-Preprocessing: Building pre-rendered NPZ cache for '{self.data_root.name}'...")
                     try:
-                        try:
-                            from opt_hq_net.data.preprocess import preprocess_magfilo_dataset
-                        except ImportError:
-                            try:
-                                from preprocess import preprocess_magfilo_dataset
-                            except ImportError:
-                                from scripts.preprocess_magfilo import preprocess_magfilo_dataset
+                        from .preprocess import preprocess_magfilo_dataset
                         preprocess_magfilo_dataset(
                             data_root=self.data_root,
                             output_dir=cache_dir,
@@ -107,7 +101,7 @@ class SolarFilamentDataset(Dataset):
                     except Exception as err:
                         print(f"[Dataset WARNING] Auto-preprocessing skipped: {err}. Falling back to dynamic parsing.")
 
-                if (cache_dir / "masks").exists() and any((cache_dir / "masks").glob("*.npz")):
+                if (cache_dir / "images").exists() and any((cache_dir / "images").glob("*.*")):
                     self.data_root = cache_dir
 
         # Flexible image directory resolution (images/, train_images/, test_images/, or data_root)
@@ -127,7 +121,7 @@ class SolarFilamentDataset(Dataset):
         else:
             self.coco_json = self._find_coco_json()
 
-        self.has_masks = (self.coco_json is not None) or self.mask_dir.exists()
+        self.has_masks = (self.coco_json is not None) or (self.mask_dir.exists() and any(self.mask_dir.glob("*.npz")))
 
         exts = image_extensions or [".png", ".jpg", ".jpeg", ".fits"]
         self.image_ids: List[str] = sorted(
@@ -163,6 +157,8 @@ class SolarFilamentDataset(Dataset):
             return json_files[0]
 
         # 2. Search in parent directories (in case data_root was resolved to train_images/)
+        # Filter parent JSON files by matching current split name to prevent train annotations being used for test set
+        split_name = self.data_root.name.lower()
         curr = self.data_root.parent
         for _ in range(3):
             if curr and curr.exists():
@@ -170,8 +166,12 @@ class SolarFilamentDataset(Dataset):
                     j for j in (list(curr.glob("*.json")) + list(curr.rglob("*.json")))
                     if j.name.lower() != "manifest.json"
                 ]
-                if parent_jsons:
-                    return parent_jsons[0]
+                matching_jsons = [
+                    j for j in parent_jsons
+                    if split_name in j.name.lower() or split_name in j.parent.name.lower()
+                ]
+                if matching_jsons:
+                    return matching_jsons[0]
                 curr = curr.parent
 
         return None

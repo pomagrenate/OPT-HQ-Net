@@ -63,8 +63,10 @@ def preprocess_magfilo_dataset(
     mask_out_dir.mkdir(parents=True, exist_ok=True)
 
     # 1. Locate COCO JSON
-    json_files = list(data_root.glob("*.json")) + list(data_root.rglob("*.json"))
-    coco_json = json_files[0] if json_files else None
+    json_files = [j for j in (list(data_root.glob("*.json")) + list(data_root.rglob("*.json"))) if j.name.lower() != "manifest.json"]
+    split_name = data_root.name.lower()
+    matching_jsons = [j for j in json_files if split_name in j.name.lower() or split_name in j.parent.name.lower()]
+    coco_json = matching_jsons[0] if matching_jsons else (json_files[0] if json_files else None)
 
     img_id_to_anns = {}
     if coco_json and coco_json.exists():

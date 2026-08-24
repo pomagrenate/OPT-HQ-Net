@@ -26,6 +26,7 @@ Example (quick smoke-test on CPU)
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 
 import torch
 from torch.utils.data import DataLoader
@@ -52,9 +53,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_workers", type=int, default=4)
 
     # Model
-    parser.add_argument("--backbone", type=str, default="convnext_large",
-                        choices=["convnext_large", "swin_large"],
-                        help="Backbone architecture.")
+    parser.add_argument("--backbone", type=str, default="convnext_tiny",
+                        help="Backbone architecture (e.g. convnext_tiny, convnext_small, convnext_large, swin_large).")
     parser.add_argument("--no_pretrained", action="store_true",
                         help="Disable ImageNet pretrained weights.")
 
@@ -120,26 +120,48 @@ def main() -> None:
     else:
         train_path = data_root_path
 
-    if (data_root_path / "val").exists():
-        val_path = data_root_path / "val"
-    elif (data_root_path / "test").exists():
-        val_path = data_root_path / "test"
-    else:
-        val_path = train_path
-
     print(f"[Main] Loading train dataset from: {train_path}")
-    print(f"[Main] Loading val dataset from:   {val_path}")
 
-    train_ds = SolarFilamentDataset(
-        data_root=train_path,
-        augment=True,
-        target_size=args.target_size,
-    )
-    val_ds = SolarFilamentDataset(
-        data_root=val_path,
-        augment=False,
-        target_size=args.target_size,
-    )
+    val_ds = None
+    if (data_root_path / "val").exists():
+        candidate_val = SolarFilamentDataset(
+            data_root=data_root_path / "val",
+            augment=False,
+            target_size=args.target_size,
+        )
+        if candidate_val.has_masks:
+            val_ds = candidate_val
+            print(f"[Main] Loading val dataset from:   {data_root_path / 'val'}")
+
+    if val_ds is not None:
+        train_ds = SolarFilamentDataset(
+            data_root=train_path,
+            augment=True,
+            target_size=args.target_size,
+        )
+    else:
+        # Fallback: Create an 80/20 train/val split from train_path for true validation
+        full_train_ds = SolarFilamentDataset(
+            data_root=train_path,
+            augment=True,
+            target_size=args.target_size,
+        )
+        full_val_ds = SolarFilamentDataset(
+            data_root=train_path,
+            augment=False,
+            target_size=args.target_size,
+        )
+
+        val_size = max(1, int(0.2 * len(full_train_ds)))
+        train_size = len(full_train_ds) - val_size
+
+        generator = torch.Generator().manual_seed(42)
+        indices = torch.randperm(len(full_train_ds), generator=generator).tolist()
+        train_indices, val_indices = indices[val_size:], indices[:val_size]
+
+        train_ds = torch.utils.data.Subset(full_train_ds, train_indices)
+        val_ds = torch.utils.data.Subset(full_val_ds, val_indices)
+        print(f"[Main] Auto Validation Split created: {train_size} train images | {val_size} val images (80/20 split)")
 
     train_loader = DataLoader(
         train_ds,
