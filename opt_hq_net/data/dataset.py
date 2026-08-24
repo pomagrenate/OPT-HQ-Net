@@ -35,6 +35,13 @@ from torch.utils.data import DataLoader, Dataset
 
 from opt_hq_net.data.augmentation import SolarAugmentation
 from opt_hq_net.data.preprocessing import CLAHEPreprocessor, SolarDiskMask
+try:
+    from opt_hq_net.data.preprocess import preprocess_magfilo_dataset
+except ImportError:
+    try:
+        from preprocess import preprocess_magfilo_dataset
+    except ImportError:
+        preprocess_magfilo_dataset = None
 
 
 # ---------------------------------------------------------------------------
@@ -91,27 +98,14 @@ class SolarFilamentDataset(Dataset):
                 if not cache_masks.exists() or not any(cache_masks.glob("*.npz")):
                     print(f"\n[Dataset] Auto-Preprocessing: Building pre-rendered NPZ cache for '{self.data_root.name}'...")
                     try:
-                        preprocess_fn = None
-                        try:
-                            from opt_hq_net.data.preprocess import preprocess_magfilo_dataset as preprocess_fn
-                        except (ImportError, ValueError):
-                            try:
-                                from .preprocess import preprocess_magfilo_dataset as preprocess_fn
-                            except (ImportError, ValueError):
-                                try:
-                                    from preprocess import preprocess_magfilo_dataset as preprocess_fn
-                                except (ImportError, ValueError):
-                                    pass
-
-                        if preprocess_fn is not None:
-                            preprocess_fn(
-                                data_root=self.data_root,
-                                output_dir=cache_dir,
-                                target_size=target_size,
-                                show_progress=True,
-                            )
-                        else:
+                        if preprocess_magfilo_dataset is None:
                             raise ImportError("Could not locate preprocess_magfilo_dataset module.")
+                        preprocess_magfilo_dataset(
+                            data_root=self.data_root,
+                            output_dir=cache_dir,
+                            target_size=target_size,
+                            show_progress=True,
+                        )
                     except Exception as err:
                         print(f"[Dataset WARNING] Auto-preprocessing skipped: {err}. Falling back to dynamic parsing.")
 
