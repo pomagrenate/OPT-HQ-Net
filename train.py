@@ -68,6 +68,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints")
     parser.add_argument("--no_amp", action="store_true", help="Disable AMP.")
     parser.add_argument("--no_grad_ckpt", action="store_true", help="Disable gradient checkpointing for max speed if VRAM permits.")
+    parser.add_argument("--use_multi_gpu", action="store_true", help="Enable nn.DataParallel across multiple GPUs.")
     parser.add_argument("--val_subset", type=int, default=0, help="Validate on first N images for rapid debugging (0 = full validation).")
     parser.add_argument("--score_thresh", type=float, default=0.01, help="Minimum proposal score during validation.")
 
@@ -102,6 +103,7 @@ def main() -> None:
         weight_decay=args.weight_decay,
         warmup_epochs=args.warmup_epochs,
         use_amp=not args.no_amp,
+        use_multi_gpu=args.use_multi_gpu,
         checkpoint_dir=args.checkpoint_dir,
         device=args.device,
         grad_checkpointing=not args.no_grad_ckpt,
