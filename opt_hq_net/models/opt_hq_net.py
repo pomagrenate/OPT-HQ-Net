@@ -156,6 +156,12 @@ class OPTHQNet(nn.Module):
             )
             loss_dict = {**rpn_losses, **mask_losses}
             loss_dict["total_loss"] = sum(loss_dict.values())
+
+            # Ensure all loss tensors are at least 1D (1,) so DataParallel can gather them across GPUs
+            loss_dict = {
+                k: (v.unsqueeze(0) if (isinstance(v, torch.Tensor) and v.ndim == 0) else v)
+                for k, v in loss_dict.items()
+            }
             return [], loss_dict
 
         # ── 6. Package per-image predictions (inference only) ─────────
