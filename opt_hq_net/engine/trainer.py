@@ -233,7 +233,7 @@ class Trainer:
                 autocast_ctx = legacy_autocast(enabled=self.use_amp)
 
             with autocast_ctx:
-                _, loss_dict = self.model(images, gt_boxes=gt_boxes, gt_masks=gt_masks)
+                _, loss_dict = self.model(images, gt_boxes, gt_masks)
 
             if not loss_dict:
                 continue
