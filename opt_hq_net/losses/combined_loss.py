@@ -51,8 +51,8 @@ class OPTHQNetLoss(nn.Module):
         lambda_box: float = 1.0,
         lambda_tversky: float = 2.0,
         lambda_skeleton: float = 1.5,
-        tversky_alpha: float = 0.3,
-        tversky_beta: float = 0.7,
+        tversky_alpha: float = 0.5,
+        tversky_beta: float = 0.5,
         tversky_gamma: float = 0.75,
         iou_match_threshold: float = 0.5,
     ) -> None:
@@ -171,10 +171,11 @@ class OPTHQNetLoss(nn.Module):
         used_pred = set()
         for g in range(G):
             best_pred = int(iou_np[:, g].argmax())
-            # Match best proposal per GT box (threshold relaxed to 0.05 to ensure early training gradients)
-            if best_pred not in used_pred and iou_np[best_pred, g] >= 0.05:
-                matched.append((best_pred, g))
-                used_pred.add(best_pred)
+            # Match best proposal per GT box (threshold 0.05, or fallback to top proposal for early training)
+            if best_pred not in used_pred:
+                if iou_np[best_pred, g] >= 0.05 or len(matched) == 0:
+                    matched.append((best_pred, g))
+                    used_pred.add(best_pred)
 
         return matched
 
