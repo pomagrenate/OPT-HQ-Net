@@ -74,6 +74,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no_grad_ckpt", action="store_true", help="Disable gradient checkpointing for max speed if VRAM permits.")
     parser.add_argument("--use_multi_gpu", action="store_true", help="Enable nn.DataParallel across multiple GPUs.")
     parser.add_argument("--val_subset", type=int, default=0, help="Validate on first N images for rapid debugging (0 = full validation).")
+    parser.add_argument("--val_every", type=int, default=1, help="Validation frequency in epochs (e.g. 5 = validate every 5 epochs).")
     parser.add_argument("--score_thresh", type=float, default=0.01, help="Minimum proposal score during validation.")
 
     # Loss weights
@@ -113,6 +114,7 @@ def main() -> None:
         device=args.device,
         grad_checkpointing=not args.no_grad_ckpt,
         val_subset=args.val_subset,
+        val_every_n_epochs=args.val_every,
     )
 
     train_cfg.loss_weights.oriented_box = args.lambda_box
