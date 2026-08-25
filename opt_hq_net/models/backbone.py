@@ -165,7 +165,7 @@ class BackboneWithFPN(nn.Module):
             self.backbone = timm.create_model(model_name, **create_kwargs)
 
         # Query the actual channel widths produced by the backbone
-        in_channels_list: List[int] = self.backbone.feature_info.channels()
+        self.in_channels_list: List[int] = self.backbone.feature_info.channels()
 
         # Enable gradient checkpointing to save up to 60% activation VRAM
         if hasattr(self.backbone, "set_grad_checkpointing"):
@@ -175,7 +175,7 @@ class BackboneWithFPN(nn.Module):
             except Exception as e:
                 pass
 
-        self.fpn = FPNNeck(in_channels_list, out_channels)
+        self.fpn = FPNNeck(self.in_channels_list, out_channels)
         self.out_channels = out_channels
 
     def set_grad_checkpointing(self, enable: bool = True) -> None:
@@ -201,7 +201,21 @@ class BackboneWithFPN(nn.Module):
             ``{'P2': ..., 'P3': ..., 'P4': ..., 'P5': ...}``
         """
         features: List[torch.Tensor] = self.backbone(x)
-        return self.fpn(features)
+
+        # Swin Transformer and Vision Transformers in timm output NHWC tensors (B, H, W, C).
+        # Standard CNN backbones output NCHW tensors (B, C, H, W).
+        # Permute NHWC -> NCHW so FPN 2D convolutions receive channels in dim 1.
+        formatted_features = []
+        for i, feat in enumerate(features):
+            if feat.ndim == 4:
+                expected_c = self.in_channels_list[i] if i < len(self.in_channels_list) else None
+                if expected_c is not None and feat.shape[1] != expected_c and feat.shape[-1] == expected_c:
+                    feat = feat.permute(0, 3, 1, 2).contiguous()
+                elif feat.shape[-1] < feat.shape[1] and feat.shape[-1] < feat.shape[2]:
+                    feat = feat.permute(0, 3, 1, 2).contiguous()
+            formatted_features.append(feat)
+
+        return self.fpn(formatted_features)
 
 
 # ---------------------------------------------------------------------------
