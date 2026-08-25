@@ -145,13 +145,24 @@ class BackboneWithFPN(nn.Module):
                 "Install with: pip install timm"
             )
 
+        # Build kwargs for timm.create_model
+        create_kwargs = {
+            "pretrained": pretrained,
+            "features_only": True,
+            "out_indices": out_indices,
+        }
+
+        # For Vision Transformers (Swin, ViT), allow arbitrary input resolutions (e.g. 512x512)
+        if "swin" in model_name.lower() or "vit" in model_name.lower():
+            create_kwargs["strict_img_size"] = False
+            create_kwargs["dynamic_img_pad"] = True
+
         # Create feature extractor (returns list of feature maps)
-        self.backbone = timm.create_model(
-            model_name,
-            pretrained=pretrained,
-            features_only=True,
-            out_indices=out_indices,
-        )
+        try:
+            self.backbone = timm.create_model(model_name, **create_kwargs)
+        except TypeError:
+            create_kwargs.pop("dynamic_img_pad", None)
+            self.backbone = timm.create_model(model_name, **create_kwargs)
 
         # Query the actual channel widths produced by the backbone
         in_channels_list: List[int] = self.backbone.feature_info.channels()
