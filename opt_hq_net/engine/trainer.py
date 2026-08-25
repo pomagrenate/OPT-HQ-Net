@@ -307,17 +307,38 @@ class Trainer:
 
             predictions, _ = self.model(images)
 
+            # Max pixel budget: a single filament is at most ~5% of the image area
+            img_h = images.shape[-2]
+            img_w = images.shape[-1]
+            max_mask_area = int(img_h * img_w * 0.10)  # 10% of image area cap
+            score_thresh = 0.05  # Minimum score to accept a prediction
+
             # Convert to numpy for metric computation
             pred_np = []
+            import numpy as _np
             for p in predictions:
-                masks = p["masks"]
+                masks  = p["masks"]   # (N, H, W)
+                scores = p["scores"]  # (N,)
                 if len(masks) > 0:
-                    bin_masks = (masks > 0.5).cpu().numpy().astype("uint8")
-                    pred_np.append(bin_masks)
-                    total_pred_instances += len(bin_masks)
-                    total_pred_pixels += int(bin_masks.sum())
+                    keep = []
+                    for mi in range(len(masks)):
+                        score = float(scores[mi]) if len(scores) > mi else 0.0
+                        if score < score_thresh:
+                            continue
+                        bin_mask = (masks[mi] > 0.5).cpu().numpy().astype("uint8")
+                        area = int(bin_mask.sum())
+                        if area == 0 or area > max_mask_area:
+                            continue
+                        keep.append(bin_mask)
+                    if keep:
+                        kept_arr = _np.stack(keep, axis=0)
+                        pred_np.append(kept_arr)
+                        total_pred_instances += len(kept_arr)
+                        total_pred_pixels += int(kept_arr.sum())
+                    else:
+                        pred_np.append(_np.zeros((0, img_h, img_w), dtype="uint8"))
                 else:
-                    pred_np.append(__import__("numpy").zeros((0, 1, 1), dtype="uint8"))
+                    pred_np.append(_np.zeros((0, img_h, img_w), dtype="uint8"))
 
             gt_np = []
             for m in gt_masks_list:
@@ -336,7 +357,7 @@ class Trainer:
                 max_score = float(torch.cat(scores_list).max()) if scores_list and len(torch.cat(scores_list)) > 0 else 0.0
                 print(
                     f"\n  [Val Debug Step {step+1:03d}] GT Instances: {batch_gt} | "
-                    f"Pred Instances: {batch_pred} (Max Score: {max_score:.4f}) | "
+                    f"Pred Instances (filtered): {batch_pred} (Max Score: {max_score:.4f}) | "
                     f"Pred FG Pixels: {sum(p.sum() for p in pred_np)} | GT FG Pixels: {sum(g.sum() for g in gt_np)}"
                 )
 
