@@ -83,11 +83,15 @@ class SolarFilamentDataset(Dataset):
         clahe_clip_limit: float = 2.0,
         image_extensions: Optional[List[str]] = None,
         target_size: int = 512,
+        patch_size: Optional[int] = None,
+        fg_patch_prob: float = 0.8,
         auto_preprocess: bool = True,
     ) -> None:
         self.data_root = Path(data_root)
         self.augment = augment
         self.target_size = target_size
+        self.patch_size = patch_size
+        self.fg_patch_prob = fg_patch_prob
 
         # ── Automatic transparent preprocessing check ────────────────────────
         if auto_preprocess:
@@ -228,6 +232,12 @@ class SolarFilamentDataset(Dataset):
         # --- Load masks and boxes (train) or create empties (test) ---
         masks_np, boxes_np = self._load_annotations(image_id, image_np.shape[:2])
 
+        # --- Optional Foreground-Centric Patch Cropping (Train) ---
+        if self.augment and self.patch_size is not None:
+            image_np, masks_np, boxes_np = self._crop_foreground_patch(
+                image_np, masks_np, boxes_np, self.patch_size
+            )
+
         # --- Augmentation ---
         if self._augmentor is not None and self.augment:
             image_np, masks_np, boxes_np = self._augmentor(
@@ -254,6 +264,66 @@ class SolarFilamentDataset(Dataset):
             "image_id": image_id,
             "num_instances": masks_t.shape[0],
         }
+
+    # ------------------------------------------------------------------
+    def _crop_foreground_patch(
+        self,
+        image_np: np.ndarray,
+        masks_np: np.ndarray,
+        boxes_np: np.ndarray,
+        patch_size: int,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Extract a patch_size × patch_size crop.
+        With probability `fg_patch_prob`, center the crop on a ground-truth filament.
+        """
+        h, w = image_np.shape[:2]
+        if h <= patch_size or w <= patch_size:
+            return image_np, masks_np, boxes_np
+
+        n_instances = len(masks_np)
+        if n_instances > 0 and np.random.rand() < self.fg_patch_prob:
+            idx = np.random.randint(0, n_instances)
+            m = masks_np[idx]
+            ys, xs = np.where(m)
+            if len(ys) > 0:
+                cy, cx = int(np.mean(ys)), int(np.mean(xs))
+            else:
+                cx, cy = int(boxes_np[idx][0]), int(boxes_np[idx][1])
+            jitter = patch_size // 4
+            cx += np.random.randint(-jitter, jitter + 1)
+            cy += np.random.randint(-jitter, jitter + 1)
+        else:
+            cx = np.random.randint(patch_size // 2, max(patch_size // 2 + 1, w - patch_size // 2))
+            cy = np.random.randint(patch_size // 2, max(patch_size // 2 + 1, h - patch_size // 2))
+
+        x1 = max(0, min(cx - patch_size // 2, w - patch_size))
+        y1 = max(0, min(cy - patch_size // 2, h - patch_size))
+        x2 = x1 + patch_size
+        y2 = y1 + patch_size
+
+        cropped_img = image_np[y1:y2, x1:x2]
+        cropped_masks = masks_np[:, y1:y2, x1:x2]
+
+        filtered_masks = []
+        filtered_boxes = []
+
+        for i, cm in enumerate(cropped_masks):
+            if cm.sum() > 0:
+                filtered_masks.append(cm)
+                box = boxes_np[i].copy()
+                box[0] -= x1
+                box[1] -= y1
+                filtered_boxes.append(box)
+
+        if filtered_masks:
+            out_masks = np.stack(filtered_masks, axis=0)
+            out_boxes = np.stack(filtered_boxes, axis=0)
+        else:
+            out_masks = np.zeros((0, patch_size, patch_size), dtype=np.uint8)
+            out_boxes = np.zeros((0, 5), dtype=np.float32)
+
+        return cropped_img, out_masks, out_boxes
 
     # ------------------------------------------------------------------
     # Private helpers

@@ -283,6 +283,13 @@ class HQMaskDecoder(nn.Module):
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
 
+        # Initialize mask head bias to match prior foreground probability π = 0.01 (-4.595)
+        # Prevents initial Focal Loss explosions that trigger background collapse
+        if hasattr(self, "mask_head") and self.mask_head.bias is not None:
+            prior_prob = 0.01
+            bias_val = -math.log((1.0 - prior_prob) / prior_prob)
+            nn.init.constant_(self.mask_head.bias, bias_val)
+
     # ------------------------------------------------------------------
     def forward(
         self,

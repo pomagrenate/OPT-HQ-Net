@@ -50,6 +50,10 @@ def parse_args() -> argparse.Namespace:
                         help="Root directory containing 'images/' and 'masks/' subdirs.")
     parser.add_argument("--target_size", type=int, default=512,
                         help="Image size for training crops (default: 512).")
+    parser.add_argument("--patch_size", type=int, default=None,
+                        help="Crop patch size for foreground-centric training (e.g. 512 or 256).")
+    parser.add_argument("--fg_patch_prob", type=float, default=0.8,
+                        help="Probability of sampling patch centered on GT filament (default: 0.8).")
     parser.add_argument("--num_workers", type=int, default=4)
 
     # Model
@@ -148,6 +152,8 @@ def main() -> None:
             data_root=train_path,
             augment=True,
             target_size=args.target_size,
+            patch_size=args.patch_size,
+            fg_patch_prob=args.fg_patch_prob,
         )
     else:
         # Fallback: Create an 80/20 train/val split from train_path for true validation

@@ -109,10 +109,14 @@ class ModelConfig:
 @dataclass
 class LossWeightConfig:
     """λ weights for the compound multi-task loss."""
-    oriented_box: float = 1.0    # λ1
-    focal: float = 2.0           # λ2
-    dice: float = 2.0            # λ3
-    skeleton: float = 1.5        # λ4
+    oriented_box: float = 1.0     # λ1
+    focal_tversky: float = 2.0   # λ2 (Asymmetric Focal-Tversky loss)
+    focal: float = 0.0            # legacy focal weight
+    dice: float = 0.0             # legacy dice weight
+    skeleton: float = 1.5         # λ3 (Skeleton-recall topological loss)
+    tversky_alpha: float = 0.3    # False positive penalty weight
+    tversky_beta: float = 0.7     # False negative penalty weight (2.33x penalty on missed filaments)
+    tversky_gamma: float = 0.75   # Focal exponent on Tversky index
 
 
 @dataclass

@@ -26,8 +26,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from opt_hq_net.losses.dice_loss import BinaryDiceLoss
-from opt_hq_net.losses.focal_loss import FocalLoss
+from opt_hq_net.losses.focal_tversky import FocalTverskyLoss
 from opt_hq_net.losses.skeleton_recall import SkeletonRecallLoss
 
 
@@ -38,11 +37,11 @@ class OPTHQNetLoss(nn.Module):
     Parameters
     ----------
     lambda_box      : float  λ1 — oriented box regression weight.
-    lambda_focal    : float  λ2 — focal loss weight.
-    lambda_dice     : float  λ3 — dice loss weight.
-    lambda_skeleton : float  λ4 — skeleton-recall loss weight.
-    focal_alpha     : float  α for FocalLoss.
-    focal_gamma     : float  γ for FocalLoss.
+    lambda_tversky  : float  λ2 — focal-tversky loss weight.
+    lambda_skeleton : float  λ3 — skeleton-recall loss weight.
+    tversky_alpha   : float  α for FocalTverskyLoss.
+    tversky_beta    : float  β for FocalTverskyLoss (higher β penalizes false negatives).
+    tversky_gamma   : float  γ for FocalTverskyLoss.
     iou_match_threshold : float
         Minimum IoU between predicted and GT box to assign a positive match.
     """
@@ -50,22 +49,24 @@ class OPTHQNetLoss(nn.Module):
     def __init__(
         self,
         lambda_box: float = 1.0,
-        lambda_focal: float = 2.0,
-        lambda_dice: float = 2.0,
+        lambda_tversky: float = 2.0,
         lambda_skeleton: float = 1.5,
-        focal_alpha: float = 0.25,
-        focal_gamma: float = 2.0,
+        tversky_alpha: float = 0.3,
+        tversky_beta: float = 0.7,
+        tversky_gamma: float = 0.75,
         iou_match_threshold: float = 0.5,
     ) -> None:
         super().__init__()
         self.lambda_box = lambda_box
-        self.lambda_focal = lambda_focal
-        self.lambda_dice = lambda_dice
+        self.lambda_tversky = lambda_tversky
         self.lambda_skeleton = lambda_skeleton
         self.iou_threshold = iou_match_threshold
 
-        self.focal_loss = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
-        self.dice_loss = BinaryDiceLoss()
+        self.tversky_loss = FocalTverskyLoss(
+            alpha=tversky_alpha,
+            beta=tversky_beta,
+            gamma=tversky_gamma,
+        )
         self.skeleton_loss = SkeletonRecallLoss()
 
     # ------------------------------------------------------------------
@@ -84,45 +85,42 @@ class OPTHQNetLoss(nn.Module):
         Returns
         -------
         dict[str, Tensor] with keys:
-            'mask_focal_loss', 'mask_dice_loss', 'mask_skeleton_loss'
+            'mask_tversky_loss', 'mask_skeleton_loss'
         """
-        device = mask_logits.device
-        B = len(proposals)
 
-        matched_logits: List[torch.Tensor] = []
-        matched_gt_masks: List[torch.Tensor] = []
-        matched_pred_boxes: List[torch.Tensor] = []
-        matched_gt_boxes: List[torch.Tensor] = []
+        matched_logits = []
+        matched_gt_masks = []
 
-        H_out, W_out = mask_logits.shape[-2:]
-
-        for i in range(B):
-            gt_b = gt_boxes[i]     # (G, 5)
-            gt_m = gt_masks[i]     # (G, H, W)
-            prop_i = proposals[i]  # (K, 5+1)
-            idx_i = batch_idx == i
-
-            if len(gt_b) == 0 or not idx_i.any():
+        batch_size = len(proposals)
+        for i in range(batch_size):
+            idx = (batch_idx == i).nonzero(as_tuple=True)[0]
+            if len(idx) == 0:
                 continue
 
-            logits_i = mask_logits[idx_i]  # (K, 1, H_out, W_out)
-            pred_boxes_i = prop_i[:, :5]   # (K, 5)
+            prop_i = proposals[i]
+            gt_boxes_i = gt_boxes[i]
+            gt_masks_i = gt_masks[i]
 
-            # Match predicted boxes to GT boxes by axis-aligned IoU
-            matches = self._match_boxes(pred_boxes_i, gt_b)
+            if len(gt_boxes_i) == 0 or len(gt_masks_i) == 0:
+                continue
 
-            # Collect matched pairs
-            for pred_j, gt_j in matches:
-                matched_logits.append(logits_i[pred_j])                     # (1, H, W)
-                matched_gt_masks.append(self._resize_gt_mask(gt_m[gt_j], H_out, W_out))
-                matched_pred_boxes.append(pred_boxes_i[pred_j].unsqueeze(0))
-                matched_gt_boxes.append(gt_b[gt_j].unsqueeze(0))
+            matches = self._match_boxes(prop_i[:, :5], gt_boxes_i)
+            logits_i = mask_logits[idx]
+
+            out_h, out_w = logits_i.shape[-2:]
+
+            for p_idx, g_idx in matches:
+                matched_logits.append(logits_i[p_idx])
+
+                gt_m = gt_masks_i[g_idx]
+                if gt_m.shape[-2:] != (out_h, out_w):
+                    gt_m = self._resize_gt_mask(gt_m, out_h, out_w)
+                matched_gt_masks.append(gt_m)
 
         if not matched_logits:
             zero = mask_logits.new_zeros(1)
             return {
-                "mask_focal_loss": zero,
-                "mask_dice_loss": zero,
+                "mask_tversky_loss": zero,
                 "mask_skeleton_loss": zero,
             }
 
@@ -130,13 +128,11 @@ class OPTHQNetLoss(nn.Module):
         logits_stk = torch.stack(matched_logits, dim=0)      # (M, 1, H, W)
         gt_masks_stk = torch.stack(matched_gt_masks, dim=0)  # (M, H, W)
 
-        focal = self.focal_loss(logits_stk.squeeze(1), gt_masks_stk.float())
-        dice = self.dice_loss(logits_stk, gt_masks_stk)
+        tversky = self.tversky_loss(logits_stk, gt_masks_stk)
         skeleton = self.skeleton_loss(logits_stk, gt_masks_stk)
 
         return {
-            "mask_focal_loss": self.lambda_focal * focal,
-            "mask_dice_loss": self.lambda_dice * dice,
+            "mask_tversky_loss": self.lambda_tversky * tversky,
             "mask_skeleton_loss": self.lambda_skeleton * skeleton,
         }
 
