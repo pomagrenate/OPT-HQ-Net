@@ -93,6 +93,7 @@ def main() -> None:
         backbone_name=args.backbone,
         backbone_pretrained=not args.no_pretrained,
     )
+
     model_cfg.rpn.score_threshold = args.score_thresh
 
     train_cfg = TrainingConfig(
@@ -109,6 +110,7 @@ def main() -> None:
         grad_checkpointing=not args.no_grad_ckpt,
         val_subset=args.val_subset,
     )
+
     train_cfg.loss_weights.oriented_box = args.lambda_box
     train_cfg.loss_weights.focal        = args.lambda_focal
     train_cfg.loss_weights.dice         = args.lambda_dice

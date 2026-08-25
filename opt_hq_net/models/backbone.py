@@ -224,6 +224,12 @@ class BackboneFactory:
         "convnext-base": "convnext_base",
         "convnext_large": "convnext_large",
         "convnext-large": "convnext_large",
+        "swin_tiny": "swin_tiny_patch4_window7_224",
+        "swin-tiny": "swin_tiny_patch4_window7_224",
+        "swin_small": "swin_small_patch4_window7_224",
+        "swin-small": "swin_small_patch4_window7_224",
+        "swin_base": "swin_base_patch4_window7_224",
+        "swin-base": "swin_base_patch4_window7_224",
         "swin_large": "swin_large_patch4_window7_224",
         "swin-large": "swin_large_patch4_window7_224",
     }
@@ -251,6 +257,7 @@ class BackboneFactory:
             Backbone stages to extract.
         """
         resolved = cls._ALIASES.get(name.lower(), name)
+        
         return BackboneWithFPN(
             model_name=resolved,
             pretrained=pretrained,
