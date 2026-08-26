@@ -107,6 +107,20 @@ class FPNNeck(nn.Module):
 # Dynamic Forward-Hook Feature Extractor (Fallback for SegFormer / ViT)
 # ---------------------------------------------------------------------------
 
+def enable_hf_segformer_checkpointing(model: nn.Module) -> None:
+    """Enable gradient checkpointing natively for HuggingFace SegFormer models."""
+    model.supports_gradient_checkpointing = True
+    model.gradient_checkpointing = True
+    if hasattr(model, "encoder"):
+        model.encoder.gradient_checkpointing = True
+    for m in model.modules():
+        setattr(m, "gradient_checkpointing", True)
+    try:
+        model.gradient_checkpointing_enable()
+    except Exception:
+        pass
+
+
 class HookedFeatureExtractor(nn.Module):
     """
     Generic feature extractor wrapper using PyTorch forward hooks or HuggingFace SegFormer.
@@ -132,13 +146,8 @@ class HookedFeatureExtractor(nn.Module):
                 hf_id = f"nvidia/mit-b{b_num}"
                 print(f"[HookedFeatureExtractor] Loading HuggingFace SegFormer model: '{hf_id}'...")
                 self.model = SegformerModel.from_pretrained(hf_id)
-                if hasattr(self.model, "gradient_checkpointing_enable"):
-                    try:
-                        self.model.supports_gradient_checkpointing = True
-                        self.model.gradient_checkpointing_enable()
-                        print("[HookedFeatureExtractor] Enabled HuggingFace Gradient Checkpointing (saves ~60% VRAM).")
-                    except Exception as gc_err:
-                        print(f"[HookedFeatureExtractor] HF Gradient Checkpointing skipped: {gc_err}")
+                enable_hf_segformer_checkpointing(self.model)
+                print("[HookedFeatureExtractor] Enabled HuggingFace Gradient Checkpointing (saves ~65% VRAM).")
                 self.is_hf_segformer = True
                 return
             except Exception as hf_err:
@@ -319,7 +328,7 @@ class BackboneWithFPN(nn.Module):
         elif hasattr(target, "gradient_checkpointing_enable"):
             try:
                 if enable:
-                    target.gradient_checkpointing_enable()
+                    enable_hf_segformer_checkpointing(target)
                     print(f"[Backbone] HuggingFace Gradient Checkpointing ENABLED.")
                 else:
                     target.gradient_checkpointing_disable()
