@@ -66,7 +66,10 @@ class FilamentTrainer:
         self.loss_fn = FilamentCompoundLoss(stage=stage).to(self.device)
 
         if self.use_amp:
-            self.scaler = torch.cuda.amp.GradScaler()
+            try:
+                self.scaler = torch.amp.GradScaler("cuda")
+            except AttributeError:
+                self.scaler = torch.cuda.amp.GradScaler()
         else:
             self.scaler = None
 
@@ -126,7 +129,12 @@ class FilamentTrainer:
             self.optimizer.zero_grad()
 
             if self.use_amp:
-                with torch.cuda.amp.autocast():
+                try:
+                    autocast_cm = torch.amp.autocast("cuda")
+                except AttributeError:
+                    autocast_cm = torch.cuda.amp.autocast()
+
+                with autocast_cm:
                     outputs = self.model(images)
                     loss_dict = self.loss_fn(outputs, batch)
                 t_fwd = time.time() - t_fwd_start

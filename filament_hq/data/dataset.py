@@ -170,12 +170,13 @@ class FilamentTileDataset(Dataset):
             else:
                 masks_arr = np.zeros((0, h_img, w_img), dtype=np.uint8)
 
-            # Apply 4-channel physical preprocessor & cache
+            # Apply 4-channel physical preprocessor
             ch4_img = self.preprocessor(img)  # (H, W, 4)
             h, w = ch4_img.shape[:2]
 
-            self._ch4_cache[img_id] = ch4_img
-            self._mask_cache[img_id] = masks_arr
+            if self.overfit_single_image:
+                self._ch4_cache[img_id] = ch4_img
+                self._mask_cache[img_id] = masks_arr
 
         # Combine instance masks into unified semantic mask and instance map
         semantic_mask = (masks_arr.sum(axis=0) > 0).astype(np.uint8) if len(masks_arr) > 0 else np.zeros((h, w), dtype=np.uint8)
