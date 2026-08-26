@@ -133,8 +133,12 @@ class HookedFeatureExtractor(nn.Module):
                 print(f"[HookedFeatureExtractor] Loading HuggingFace SegFormer model: '{hf_id}'...")
                 self.model = SegformerModel.from_pretrained(hf_id)
                 if hasattr(self.model, "gradient_checkpointing_enable"):
-                    self.model.gradient_checkpointing_enable()
-                    print("[HookedFeatureExtractor] Enabled HuggingFace Gradient Checkpointing (saves ~60% VRAM).")
+                    try:
+                        self.model.supports_gradient_checkpointing = True
+                        self.model.gradient_checkpointing_enable()
+                        print("[HookedFeatureExtractor] Enabled HuggingFace Gradient Checkpointing (saves ~60% VRAM).")
+                    except Exception as gc_err:
+                        print(f"[HookedFeatureExtractor] HF Gradient Checkpointing skipped: {gc_err}")
                 self.is_hf_segformer = True
                 return
             except Exception as hf_err:
