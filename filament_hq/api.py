@@ -52,9 +52,14 @@ class FilamentHQ:
             print(f"[FilamentHQ] Loading pretrained weights from '{weights}'...")
             state_dict = torch.load(weights, map_location=self.device)
             if "model_state_dict" in state_dict:
-                self.model.load_state_dict(state_dict["model_state_dict"])
-            else:
-                self.model.load_state_dict(state_dict)
+                state_dict = state_dict["model_state_dict"]
+
+            # Flexible Warm-Start loading (load matching layers, ignore new task heads)
+            model_sd = self.model.state_dict()
+            matched_sd = {k: v for k, v in state_dict.items() if k in model_sd and model_sd[k].shape == v.shape}
+            model_sd.update(matched_sd)
+            self.model.load_state_dict(model_sd)
+            print(f"  [Warm-Start Success] Loaded {len(matched_sd)}/{len(model_sd)} matching layer tensors into FilamentHQ {version.upper()}!")
 
     def train(
         self,

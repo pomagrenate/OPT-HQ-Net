@@ -35,6 +35,7 @@ def parse_args():
     parser.add_argument("--use_multi_gpu", action="store_true", help="Launch DistributedDataParallel across multi-GPUs")
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints_hq", help="Directory to save checkpoints")
     parser.add_argument("--cache", type=str, default=None, help="Path to offline precomputed cache directory")
+    parser.add_argument("--weights", type=str, default=None, help="Path to pretrained weights for warm-start transfer learning")
     return parser.parse_args()
 
 
@@ -46,15 +47,16 @@ def main():
     print("========================================================")
     print(f" Data Root     : {args.data_root}")
     print(f" Cache Path    : {args.cache or 'None (Online)'}")
+    print(f" Pretrained    : {args.weights or 'None (From Scratch)'}")
     print(f" Architecture  : Filament-HQ {args.version.upper()}")
     print(f" Backbone      : {args.backbone}")
-    print(f" Input Contract: {args.imgsz}x{args.imgsz} (Zero Downsampling)")
+    print(f" Native Tile   : {args.imgsz}x{args.imgsz}")
     print(f" Stage         : Stage {args.stage}")
     print(f" AMP Enabled   : {args.use_amp}")
     print(f" Overfit Mode  : {args.overfit_single_image}")
     print("========================================================\n")
 
-    model = FilamentHQ(backbone=args.backbone, version=args.version)
+    model = FilamentHQ(backbone=args.backbone, version=args.version, weights=args.weights)
 
     model.train(
         data_root=args.data_root,
