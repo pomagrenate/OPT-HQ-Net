@@ -95,6 +95,7 @@ def build_cache():
                 coco_anns.setdefault(stem, []).append({**ann, "_h": h, "_w": w})
 
     preprocessor = SolarPhysicalPreprocessor()
+    index_metadata = {}
     start_time = time.time()
 
     print(f"[CacheBuilder] Building dataset cache to '{output_dir}'...")
