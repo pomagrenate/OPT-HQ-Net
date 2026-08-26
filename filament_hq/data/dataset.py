@@ -267,3 +267,25 @@ class FilamentTileDataset(Dataset):
                 masks = np.flipud(masks)
 
         return img.copy(), sem.copy(), bnd.copy(), skl.copy(), masks.copy()
+
+
+def filament_hq_collate_fn(batch: List[Dict[str, any]]) -> Dict[str, any]:
+    """
+    Custom collate function handling fixed-size dense tensors and variable instance masks.
+    """
+    images = torch.stack([item["image"] for item in batch], dim=0)
+    semantics = torch.stack([item["semantic"] for item in batch], dim=0)
+    boundaries = torch.stack([item["boundary"] for item in batch], dim=0)
+    skeletons = torch.stack([item["skeleton"] for item in batch], dim=0)
+    instances = [item["instances"] for item in batch]  # List of (N_i, H, W) tensors
+    image_ids = [item["image_id"] for item in batch]
+
+    return {
+        "image": images,
+        "semantic": semantics,
+        "boundary": boundaries,
+        "skeleton": skeletons,
+        "instances": instances,
+        "image_id": image_ids,
+    }
+

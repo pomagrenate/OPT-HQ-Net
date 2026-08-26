@@ -17,7 +17,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from filament_hq.data.dataset import FilamentTileDataset
+from filament_hq.data.dataset import FilamentTileDataset, filament_hq_collate_fn
 from filament_hq.data.preprocessor import SolarPhysicalPreprocessor
 from filament_hq.data.tiler import ImageTiler, TileStitcher
 from filament_hq.engine.trainer import FilamentTrainer
@@ -103,6 +103,7 @@ class FilamentHQ:
             num_workers=workers,
             pin_memory=torch.cuda.is_available(),
             persistent_workers=(workers > 0),
+            collate_fn=filament_hq_collate_fn,
         )
 
         val_ds = FilamentTileDataset(
@@ -120,6 +121,7 @@ class FilamentHQ:
             num_workers=workers,
             pin_memory=torch.cuda.is_available(),
             persistent_workers=(workers > 0),
+            collate_fn=filament_hq_collate_fn,
         )
 
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=1e-4)
