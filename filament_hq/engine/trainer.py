@@ -27,8 +27,10 @@ from tqdm import tqdm
 from filament_hq.data.dataset import FilamentTileDataset
 from filament_hq.data.tiler import TileStitcher, ImageTiler
 from filament_hq.losses.losses import FilamentCompoundLoss, check_finite
-from filament_hq.models.model import FilamentHQModel
 from filament_hq.metrics.panoptic_quality import PanopticQualityMetric
+from filament_hq.models.model import FilamentHQModel
+from filament_hq.postprocessing.grouping import FilamentPostProcessor
+from filament_hq.visualization.visualizer import FilamentVisualizer
 
 
 class FilamentTrainer:
@@ -74,6 +76,8 @@ class FilamentTrainer:
             self.scaler = None
 
         self.metric = PanopticQualityMetric(iou_threshold=0.5)
+        self.postprocessor = FilamentPostProcessor(seed_thresh=0.65, mask_thresh=0.35, min_area=50)
+        self.visualizer = FilamentVisualizer(output_dir=self.checkpoint_dir / "val_visualizations")
 
     def train(self) -> Dict[str, float]:
         """
@@ -177,31 +181,45 @@ class FilamentTrainer:
 
         total_gt_instances = 0
         total_pred_instances = 0
+        total_coco_gt = 0
+
+        first_sample_data = None
 
         pbar = tqdm(self.val_loader, desc=f"Epoch {epoch:03d} [Val  ]", leave=False)
         for step, batch in enumerate(pbar):
             images = batch["image"].to(self.device)
-            gt_masks = batch["semantic"].cpu().numpy()  # (B, 1, 1024, 1024)
+            gt_semantic = batch["semantic"].cpu().numpy()  # (B, 1, 1024, 1024)
 
             outputs = self.model(images)
             sem_probs = torch.sigmoid(outputs["semantic"]).cpu().numpy()  # (B, 1, 1024, 1024)
+            bnd_probs = torch.sigmoid(outputs["boundary"]).cpu().numpy() if "boundary" in outputs else None
+            skl_probs = torch.sigmoid(outputs["skeleton"]).cpu().numpy() if "skeleton" in outputs else None
 
             pred_np = []
             gt_np = []
 
             for b in range(images.shape[0]):
-                p_mask = (sem_probs[b, 0] > 0.5).astype(np.uint8)
-                g_mask = (gt_masks[b, 0] > 0.5).astype(np.uint8)
+                # 1. Extract GT Instance Masks (prefer exact COCO instance list if available)
+                if "instance_masks" in batch and isinstance(batch["instance_masks"], list):
+                    gt_arr = batch["instance_masks"][b]
+                    if isinstance(gt_arr, torch.Tensor):
+                        gt_arr = gt_arr.cpu().numpy()
+                    total_coco_gt += len(gt_arr)
+                else:
+                    g_mask = (gt_semantic[b, 0] > 0.5).astype(np.uint8)
+                    num_g, g_labels = cv2.connectedComponents(g_mask)
+                    g_insts = [(g_labels == j).astype(np.uint8) for j in range(1, num_g)]
+                    gt_arr = np.stack(g_insts, axis=0) if g_insts else np.zeros((0, 1024, 1024), dtype=np.uint8)
 
-                # Connected components for instance splitting
-                num_p, p_labels = cv2.connectedComponents(p_mask)
-                num_g, g_labels = cv2.connectedComponents(g_mask)
+                # 2. Hysteresis Post-Processing Grouping for Predicted Instances
+                b_bnd = bnd_probs[b, 0] if bnd_probs is not None else None
+                b_skl = skl_probs[b, 0] if skl_probs is not None else None
 
-                p_insts = [(p_labels == i).astype(np.uint8) for i in range(1, num_p)]
-                g_insts = [(g_labels == j).astype(np.uint8) for j in range(1, num_g)]
-
-                pred_arr = np.stack(p_insts, axis=0) if p_insts else np.zeros((0, 1024, 1024), dtype=np.uint8)
-                gt_arr = np.stack(g_insts, axis=0) if g_insts else np.zeros((0, 1024, 1024), dtype=np.uint8)
+                pred_arr = self.postprocessor.process(
+                    sem_prob=sem_probs[b, 0],
+                    bnd_prob=b_bnd,
+                    skl_prob=b_skl,
+                )
 
                 pred_np.append(pred_arr)
                 gt_np.append(gt_arr)
@@ -209,15 +227,42 @@ class FilamentTrainer:
                 total_pred_instances += len(pred_arr)
                 total_gt_instances += len(gt_arr)
 
+                # Cache first sample for diagnostic visualization
+                if first_sample_data is None:
+                    raw_img = images[b].cpu().numpy().transpose(1, 2, 0)
+                    first_sample_data = (
+                        raw_img,
+                        gt_arr,
+                        sem_probs[b, 0],
+                        b_bnd if b_bnd is not None else np.zeros_like(sem_probs[b, 0]),
+                        b_skl if b_skl is not None else np.zeros_like(sem_probs[b, 0]),
+                        pred_arr,
+                    )
+
             self.metric.update(pred_np, gt_np)
 
-            # In overfit mode, stop validation after 2 batches max
             if self.overfit_single_image and step >= 1:
                 break
 
         metrics = self.metric.compute()
+
+        # Save diagnostic 4-panel visualization
+        if first_sample_data is not None:
+            raw_img, gt_arr, p_sem, p_bnd, p_skl, p_inst = first_sample_data
+            vis_path = self.visualizer.generate_visualization(
+                epoch=epoch,
+                raw_img=raw_img,
+                gt_instances=gt_arr,
+                pred_sem=p_sem,
+                pred_bnd=p_bnd,
+                pred_skl=p_skl,
+                pred_instances=p_inst,
+                metrics=metrics,
+            )
+            print(f"\n  [Visualizer] Saved 4-panel validation audit plot to: {vis_path}")
+
         print(
-            f"  [Val Epoch {epoch:03d}] GT Inst: {total_gt_instances} | Pred Inst: {total_pred_instances} | "
+            f"  [Val Epoch {epoch:03d}] GT Inst: {total_gt_instances} (COCO: {total_coco_gt}) | Pred Inst: {total_pred_instances} | "
             f"TP: {metrics.get('TP', 0)} | FP: {metrics.get('FP', 0)} | FN: {metrics.get('FN', 0)} | "
             f"Mean Dice: {metrics.get('mean_dice', 0.0):.4f} | PQ: {metrics.get('PQ', 0.0):.4f}"
         )
