@@ -36,10 +36,16 @@ class FilamentHQ:
         Path to pretrained model checkpoint weights.
     """
 
-    def __init__(self, backbone: str = "convnext_tiny", weights: Optional[str | Path] = None) -> None:
+    def __init__(
+        self,
+        backbone: str = "convnext_tiny",
+        version: str = "v2",
+        weights: Optional[str | Path] = None,
+    ) -> None:
         self.backbone = backbone
+        self.version = version
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = FilamentHQModel(backbone_name=backbone, in_channels=4, embed_dim=16).to(self.device)
+        self.model = FilamentHQModel(backbone=backbone, version=version, in_channels=4, embed_dim=16).to(self.device)
         self.preprocessor = SolarPhysicalPreprocessor()
 
         if weights and Path(weights).exists():

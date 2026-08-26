@@ -24,6 +24,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Filament-HQ High-Resolution Training CLI")
     parser.add_argument("--data_root", type=str, required=True, help="Path to dataset directory")
     parser.add_argument("--backbone", type=str, default="convnext_tiny", help="Backbone model (default: convnext_tiny)")
+    parser.add_argument("--version", type=str, default="v2", choices=["v1", "v2"], help="Architecture version (v1 or v2)")
     parser.add_argument("--imgsz", type=int, default=1024, help="Fixed input tile size (default: 1024)")
     parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=2, help="Batch size per GPU")
@@ -41,10 +42,11 @@ def main():
     args = parse_args()
 
     print("\n========================================================")
-    print("      🚀 FILAMENT-HQ FRAMEWORK v1.0 INITIALIZED        ")
+    print("      🚀 FILAMENT-HQ FRAMEWORK INITIALIZED              ")
     print("========================================================")
     print(f" Data Root     : {args.data_root}")
     print(f" Cache Path    : {args.cache or 'None (Online)'}")
+    print(f" Architecture  : Filament-HQ {args.version.upper()}")
     print(f" Backbone      : {args.backbone}")
     print(f" Input Contract: {args.imgsz}x{args.imgsz} (Zero Downsampling)")
     print(f" Stage         : Stage {args.stage}")
@@ -52,7 +54,7 @@ def main():
     print(f" Overfit Mode  : {args.overfit_single_image}")
     print("========================================================\n")
 
-    model = FilamentHQ(backbone=args.backbone)
+    model = FilamentHQ(backbone=args.backbone, version=args.version)
 
     model.train(
         data_root=args.data_root,
