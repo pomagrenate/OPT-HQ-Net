@@ -26,6 +26,7 @@ from tqdm import tqdm
 
 from filament_hq.data.dataset import FilamentTileDataset
 from filament_hq.data.tiler import TileStitcher, ImageTiler
+from filament_hq.engine.ema import ModelEMA
 from filament_hq.losses.losses import FilamentCompoundLoss, check_finite
 from filament_hq.metrics.panoptic_quality import PanopticQualityMetric
 from filament_hq.models.model import FilamentHQModel
@@ -66,6 +67,7 @@ class FilamentTrainer:
             self.model.parameters(), lr=1e-4, weight_decay=1e-4
         )
         self.loss_fn = FilamentCompoundLoss(stage=stage).to(self.device)
+        self.ema = ModelEMA(self.model, decay=0.999, device=str(self.device))
 
         if self.use_amp:
             try:
@@ -149,6 +151,7 @@ class FilamentTrainer:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
+                self.ema.update(self.model)
                 t_bwd = time.time() - t_bwd_start
             else:
                 outputs = self.model(images)
@@ -159,6 +162,7 @@ class FilamentTrainer:
                 loss_dict["total_loss"].backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.optimizer.step()
+                self.ema.update(self.model)
                 t_bwd = time.time() - t_bwd_start
 
             if epoch == 1 and step == 0:
@@ -176,7 +180,8 @@ class FilamentTrainer:
 
     @torch.no_grad()
     def _validate(self, epoch: int) -> Dict[str, float]:
-        self.model.eval()
+        eval_model = self.ema.module
+        eval_model.eval()
         self.metric.reset()
 
         total_gt_instances = 0
@@ -190,7 +195,7 @@ class FilamentTrainer:
             images = batch["image"].to(self.device)
             gt_semantic = batch["semantic"].cpu().numpy()  # (B, 1, 1024, 1024)
 
-            outputs = self.model(images)
+            outputs = eval_model(images)
             sem_probs = torch.sigmoid(outputs["semantic"]).cpu().numpy()  # (B, 1, 1024, 1024)
             bnd_probs = torch.sigmoid(outputs["boundary"]).cpu().numpy() if "boundary" in outputs else None
             skl_probs = torch.sigmoid(outputs["skeleton"]).cpu().numpy() if "skeleton" in outputs else None

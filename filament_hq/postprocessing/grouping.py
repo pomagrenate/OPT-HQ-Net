@@ -48,6 +48,7 @@ class FilamentPostProcessor:
         sem_prob: np.ndarray,
         bnd_prob: Optional[np.ndarray] = None,
         skl_prob: Optional[np.ndarray] = None,
+        aff_prob: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """
         Convert continuous prediction heatmaps into clean instance masks.

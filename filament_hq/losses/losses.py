@@ -124,21 +124,25 @@ class InstanceEmbeddingLoss(nn.Module):
         return torch.nan_to_num(res, nan=0.0)
 
 
+from filament_hq.losses.instance import DiscriminativeEmbeddingLoss, AffinityLoss
+
+
 class FilamentCompoundLoss(nn.Module):
     """
-    Curriculum Compound Loss for Filament-HQ.
+    Curriculum Multi-Task Compound Loss for Filament-HQ.
 
     Parameters
     ----------
     stage : int
-        Curriculum stage (1: Semantic+Boundary, 2: +Skeleton, 3: +Instance).
+        Curriculum stage (1: Semantic+Boundary, 2: +Skeleton, 3: +Embedding+Affinity).
     """
 
     def __init__(self, stage: int = 1) -> None:
         super().__init__()
         self.stage = stage
         self.focal_dice = FocalDiceLoss()
-        self.instance_loss_fn = InstanceEmbeddingLoss()
+        self.instance_loss_fn = DiscriminativeEmbeddingLoss()
+        self.affinity_loss_fn = AffinityLoss()
 
     def forward(
         self,
@@ -151,7 +155,8 @@ class FilamentCompoundLoss(nn.Module):
         sem_logits = outputs["semantic"]
         bnd_logits = outputs["boundary"]
         skl_logits = outputs["skeleton"]
-        inst_embeds = outputs["instance"]
+        inst_embeds = outputs.get("embedding", outputs.get("instance"))
+        aff_logits = outputs.get("affinity")
 
         sem_gt = batch["semantic"]
         bnd_gt = batch["boundary"]
@@ -161,12 +166,12 @@ class FilamentCompoundLoss(nn.Module):
         # 1. Semantic Loss
         l_sem = self.focal_dice(sem_logits, sem_gt)
 
-        # 2. Boundary Loss
+        # 2. Boundary Loss (auxiliary)
         bnd_logits_clamped = torch.clamp(bnd_logits, min=-10.0, max=10.0)
         l_bnd = F.binary_cross_entropy_with_logits(bnd_logits_clamped, bnd_gt)
         l_bnd = torch.nan_to_num(l_bnd, nan=0.0)
 
-        # 3. Skeleton Loss
+        # 3. Skeleton Topology Loss
         skl_logits_clamped = torch.clamp(skl_logits, min=-10.0, max=10.0)
         skl_probs = torch.sigmoid(skl_logits_clamped)
         n_skel = skl_gt.sum()
@@ -177,21 +182,26 @@ class FilamentCompoundLoss(nn.Module):
             l_skl = sem_logits.new_zeros(1)
         l_skl = torch.nan_to_num(l_skl, nan=0.0)
 
-        # 4. Instance Loss
-        if self.stage >= 3:
+        # 4. Instance Embedding Loss & Affinity Loss
+        if self.stage >= 2 and inst_embeds is not None and inst_gt is not None:
             l_inst = self.instance_loss_fn(inst_embeds, inst_gt)
         else:
             l_inst = sem_logits.new_zeros(1)
 
+        if self.stage >= 2 and aff_logits is not None and inst_gt is not None:
+            l_aff = self.affinity_loss_fn(aff_logits, inst_gt)
+        else:
+            l_aff = sem_logits.new_zeros(1)
+
         # Stage-specific weighting
         if self.stage == 1:
-            w_sem, w_bnd, w_skl, w_inst = 1.0, 0.5, 0.0, 0.0
+            w_sem, w_bnd, w_skl, w_inst, w_aff = 1.0, 0.3, 0.3, 0.0, 0.0
         elif self.stage == 2:
-            w_sem, w_bnd, w_skl, w_inst = 1.0, 0.5, 0.25, 0.0
+            w_sem, w_bnd, w_skl, w_inst, w_aff = 1.0, 0.3, 0.3, 0.5, 0.5
         else:
-            w_sem, w_bnd, w_skl, w_inst = 1.0, 0.5, 0.5, 1.0
+            w_sem, w_bnd, w_skl, w_inst, w_aff = 1.0, 0.3, 0.5, 0.5, 0.5
 
-        total_loss = w_sem * l_sem + w_bnd * l_bnd + w_skl * l_skl + w_inst * l_inst
+        total_loss = w_sem * l_sem + w_bnd * l_bnd + w_skl * l_skl + w_inst * l_inst + w_aff * l_aff
         total_loss = torch.nan_to_num(total_loss, nan=0.0)
 
         return {
@@ -199,5 +209,6 @@ class FilamentCompoundLoss(nn.Module):
             "loss_boundary": l_bnd,
             "loss_skeleton": l_skl,
             "loss_instance": l_inst,
+            "loss_affinity": l_aff,
             "total_loss": total_loss,
         }

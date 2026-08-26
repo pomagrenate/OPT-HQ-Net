@@ -79,27 +79,16 @@ class FilamentHQModel(nn.Module):
             pretrained=pretrained,
         )
 
-        # 2. Four Dense Heads
+        # 2. Dense Task Heads
         self.semantic_head = DenseHead(in_channels=128, out_channels=1, is_embedding=False)
         self.boundary_head = DenseHead(in_channels=128, out_channels=1, is_embedding=False)
         self.skeleton_head = DenseHead(in_channels=128, out_channels=1, is_embedding=False)
         self.instance_head = DenseHead(in_channels=128, out_channels=embed_dim, is_embedding=True)
+        self.affinity_head = DenseHead(in_channels=128, out_channels=2, is_embedding=False)
 
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
         Forward pass for 1024x1024 input batch.
-
-        Parameters
-        ----------
-        x : Tensor (B, 4, H, W)
-
-        Returns
-        -------
-        dict[str, Tensor] with keys:
-            'semantic' : (B, 1, H, W) logits
-            'boundary' : (B, 1, H, W) logits
-            'skeleton' : (B, 1, H, W) logits
-            'instance' : (B, 16, H, W) L2-normalized embeddings
         """
         target_size = (x.shape[-2], x.shape[-1])
 
@@ -111,10 +100,13 @@ class FilamentHQModel(nn.Module):
         bnd_logits = self.boundary_head(p2_fused, target_size)
         skl_logits = self.skeleton_head(p2_fused, target_size)
         inst_embeds = self.instance_head(p2_fused, target_size)
+        aff_logits = self.affinity_head(p2_fused, target_size)
 
         return {
             "semantic": sem_logits,
             "boundary": bnd_logits,
             "skeleton": skl_logits,
             "instance": inst_embeds,
+            "embedding": inst_embeds,
+            "affinity": aff_logits,
         }
