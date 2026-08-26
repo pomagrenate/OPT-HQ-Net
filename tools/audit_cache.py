@@ -5,8 +5,15 @@ Cache Verification & Audit Script for Filament-HQ.
 from __future__ import annotations
 
 import argparse
+import os
 import pickle
+import sys
 from pathlib import Path
+
+# Add repository root directory to sys.path
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 import numpy as np
 
