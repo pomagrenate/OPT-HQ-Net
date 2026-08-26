@@ -65,6 +65,8 @@ def parse_args() -> argparse.Namespace:
     # Training
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=2,
+                        help="Number of steps to accumulate gradients before optimizer step.")
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--warmup_epochs", type=int, default=5)
@@ -113,6 +115,7 @@ def run_ddp_worker(rank: int, world_size: int, args: argparse.Namespace) -> None
     train_cfg = TrainingConfig(
         num_epochs=args.epochs,
         batch_size=args.batch_size,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
         num_workers=args.num_workers,
         learning_rate=args.lr,
         weight_decay=args.weight_decay,
@@ -223,6 +226,7 @@ def run_single_process(args: argparse.Namespace) -> None:
     train_cfg = TrainingConfig(
         num_epochs=args.epochs,
         batch_size=args.batch_size,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
         num_workers=args.num_workers,
         learning_rate=args.lr,
         weight_decay=args.weight_decay,
