@@ -346,6 +346,9 @@ class Trainer:
                         if score < score_thresh:
                             continue
                         bin_mask = (masks[mi] > 0.5).cpu().numpy().astype("uint8")
+                        if bin_mask.shape != (img_h, img_w):
+                            import cv2
+                            bin_mask = cv2.resize(bin_mask, (img_w, img_h), interpolation=cv2.INTER_NEAREST)
                         area = int(bin_mask.sum())
                         if area == 0 or area > max_mask_area:
                             continue

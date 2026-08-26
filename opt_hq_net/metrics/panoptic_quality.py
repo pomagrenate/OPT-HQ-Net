@@ -195,6 +195,19 @@ class PanopticQualityMetric:
         """
         P, H, W = pred_masks.shape
         G = gt_masks.shape[0]
+
+        # Spatial shape matching fallback (e.g. 512x512 pred vs 2048x2048 GT)
+        if G > 0 and P > 0:
+            Hg, Wg = gt_masks.shape[1], gt_masks.shape[2]
+            if (H, W) != (Hg, Wg):
+                import cv2
+                resized_preds = [
+                    cv2.resize(pm, (Wg, Hg), interpolation=cv2.INTER_NEAREST)
+                    for pm in pred_masks
+                ]
+                pred_masks = np.stack(resized_preds, axis=0)
+                P, H, W = pred_masks.shape
+
         iou_mat = np.zeros((P, G), dtype=np.float32)
 
         # Flatten masks
@@ -213,6 +226,9 @@ class PanopticQualityMetric:
     @staticmethod
     def _compute_dice(pred: np.ndarray, gt: np.ndarray) -> float:
         """Compute Dice coefficient for a single matched pair."""
+        if pred.shape != gt.shape:
+            import cv2
+            pred = cv2.resize(pred, (gt.shape[1], gt.shape[0]), interpolation=cv2.INTER_NEAREST)
         pred_b = pred.astype(bool)
         gt_b = gt.astype(bool)
         inter = (pred_b & gt_b).sum()
