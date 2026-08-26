@@ -257,6 +257,32 @@ class BackboneFactory:
         "swin-base": "swin_base_patch4_window7_224",
         "swin_large": "swin_large_patch4_window7_224",
         "swin-large": "swin_large_patch4_window7_224",
+        # SegFormer (MixTransformer) backbones
+        "segformer_b0": "mit_b0",
+        "segformer-b0": "mit_b0",
+        "segformer_b1": "mit_b1",
+        "segformer-b1": "mit_b1",
+        "segformer_b2": "mit_b2",
+        "segformer-b2": "mit_b2",
+        "segformer_b3": "mit_b3",
+        "segformer-b3": "mit_b3",
+        "segformer_b4": "mit_b4",
+        "segformer-b4": "mit_b4",
+        "segformer_b5": "mit_b5",
+        "segformer-b5": "mit_b5",
+        "mit_b0": "mit_b0",
+        "mit_b1": "mit_b1",
+        "mit_b2": "mit_b2",
+        "mit_b3": "mit_b3",
+        "mit_b4": "mit_b4",
+        "mit_b5": "mit_b5",
+        # HRNet backbones
+        "hrnet_w18": "hrnet_w18",
+        "hrnet-w18": "hrnet_w18",
+        "hrnet_w32": "hrnet_w32",
+        "hrnet-w32": "hrnet_w32",
+        "hrnet_w48": "hrnet_w48",
+        "hrnet-w48": "hrnet_w48",
     }
 
     @classmethod
