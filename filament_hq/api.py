@@ -62,6 +62,7 @@ class FilamentHQ:
         overfit_single_image: bool = False,
         checkpoint_dir: str = "checkpoints_hq",
         num_workers: int = 2,
+        cache_dir: Optional[str | Path] = None,
     ) -> Dict[str, float]:
         """
         Train the FilamentHQ model on high-resolution dataset.
