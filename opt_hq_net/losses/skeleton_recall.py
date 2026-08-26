@@ -111,7 +111,8 @@ class SkeletonRecallLoss(nn.Module):
             recall = torch.clamp(recall, min=0.0, max=1.0)
             loss_sum = loss_sum + (1.0 - recall)
 
-        return loss_sum / max(N, 1)
+        res_loss = loss_sum / max(N, 1)
+        return torch.nan_to_num(res_loss, nan=0.0)
 
     # ------------------------------------------------------------------
     @staticmethod

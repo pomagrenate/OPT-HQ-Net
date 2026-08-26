@@ -258,10 +258,15 @@ class Trainer:
             if not loss_dict:
                 continue
 
-            # Handle multi-GPU loss vector gathering
+            # Handle multi-GPU loss vector gathering and NaN/Inf protection
+            clean_loss_dict = {}
             for k, v in loss_dict.items():
-                if isinstance(v, torch.Tensor) and v.ndim > 0:
-                    loss_dict[k] = v.mean()
+                if isinstance(v, torch.Tensor):
+                    v_mean = v.mean() if v.ndim > 0 else v
+                    clean_loss_dict[k] = torch.nan_to_num(v_mean, nan=0.0, posinf=0.0, neginf=0.0)
+                else:
+                    clean_loss_dict[k] = v
+            loss_dict = clean_loss_dict
 
             total_loss = loss_dict["total_loss"] / grad_accum
 

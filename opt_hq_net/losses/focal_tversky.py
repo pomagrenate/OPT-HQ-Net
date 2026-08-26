@@ -92,7 +92,7 @@ class FocalTverskyLoss(nn.Module):
         fn = ((1.0 - probs_flat) * targets_flat).sum()
 
         tversky = (tp + self.smooth) / (tp + self.alpha * fp + self.beta * fn + self.smooth)
-        tversky = torch.clamp(tversky, min=0.0, max=1.0 - 1e-7)
-        tversky_loss = torch.clamp(1.0 - tversky, min=1e-7) ** self.gamma
+        tversky = torch.clamp(tversky, min=0.0, max=1.0)
+        tversky_loss = torch.clamp(1.0 - tversky, min=0.0, max=1.0) ** self.gamma
 
-        return tversky_loss
+        return torch.nan_to_num(tversky_loss, nan=0.0)

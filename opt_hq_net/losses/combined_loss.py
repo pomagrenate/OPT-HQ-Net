@@ -131,6 +131,9 @@ class OPTHQNetLoss(nn.Module):
         tversky = self.tversky_loss(logits_stk, gt_masks_stk)
         skeleton = self.skeleton_loss(logits_stk, gt_masks_stk)
 
+        tversky = torch.nan_to_num(tversky, nan=0.0)
+        skeleton = torch.nan_to_num(skeleton, nan=0.0)
+
         return {
             "mask_tversky_loss": self.lambda_tversky * tversky,
             "mask_skeleton_loss": self.lambda_skeleton * skeleton,
