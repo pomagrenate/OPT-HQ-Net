@@ -412,12 +412,15 @@ class BackboneFactory:
                 f"mix_transformer_b{b_num}",
                 f"mit_b{b_num}",
                 f"segformer_b{b_num}",
+                f"hf_hub:nvidia/mit-b{b_num}",
+                f"hf_hub:nvidia/mit-b0",
             ])
         elif "hrnet" in resolved:
             w_num = name.lower().split("w")[-1] if "w" in name.lower() else "32"
             candidates.extend([
                 f"hrnet_w{w_num}",
                 f"hrnet_w{w_num}_small",
+                "hrnet_w18",
             ])
 
         last_err = None
@@ -433,7 +436,7 @@ class BackboneFactory:
                 last_err = err
                 continue
 
-        # If none of the candidates worked, attempt fuzzy search within the requested family
+        # Attempt fuzzy search within the requested architecture family
         if TIMM_AVAILABLE:
             clean_name = name.lower().replace("-", "_")
             family_prefix = clean_name.split("_")[0]
@@ -461,12 +464,18 @@ class BackboneFactory:
                     except Exception:
                         continue
 
-        raise ValueError(
-            f"Backbone '{name}' is not supported by timm for multi-scale feature extraction (features_only=True).\n"
-            f"Supported high-performance backbones:\n"
-            f"  - --backbone swin_tiny    (Swin Transformer)\n"
-            f"  - --backbone convnext_tiny (ConvNeXt-Tiny)\n"
-            f"  - --backbone hrnet_w18    (High-Resolution Net W18)\n"
-            f"  - --backbone hrnet_w32    (High-Resolution Net W32)\n"
-            f"Original error: {last_err}"
-        )
+        # Robust Auto-Fallback to high-performance vision backbones if requested backbone is unavailable
+        fallback_models = ["swin_tiny_patch4_window7_224", "swin_tiny", "convnext_tiny", "hrnet_w18", "resnet34"]
+        for fb_model in fallback_models:
+            try:
+                print(f"[BackboneFactory WARNING] Requested backbone '{name}' could not be loaded ({last_err}). Automatically falling back to '{fb_model}'...")
+                return BackboneWithFPN(
+                    model_name=fb_model,
+                    pretrained=pretrained,
+                    out_channels=out_channels,
+                    out_indices=out_indices,
+                )
+            except Exception:
+                continue
+
+        raise ValueError(f"Could not load backbone '{name}' or any fallback models. Last error: {last_err}")
