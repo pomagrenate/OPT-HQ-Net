@@ -84,6 +84,8 @@ class FilamentHQ:
             Enable Automatic Mixed Precision.
         overfit_single_image : bool
             Phase 0 overfit test mode (trains on 1 image only).
+        cache_dir : str | Path, optional
+            Optional directory for caching processed tiles.
         """
         # Create Train & Val Datasets
         train_ds = FilamentTileDataset(
@@ -92,6 +94,7 @@ class FilamentHQ:
             fg_prob=0.8,
             augment=True,
             overfit_single_image=overfit_single_image,
+            cache_dir=cache_dir,
         )
 
         workers = 0 if overfit_single_image else num_workers
@@ -112,6 +115,7 @@ class FilamentHQ:
             fg_prob=0.0,
             augment=False,
             overfit_single_image=overfit_single_image,
+            cache_dir=cache_dir,
         )
 
         val_loader = DataLoader(

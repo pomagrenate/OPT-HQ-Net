@@ -33,6 +33,7 @@ def parse_args():
     parser.add_argument("--overfit_single_image", action="store_true", help="Phase 0: Run single-image FP32 overfit verification test")
     parser.add_argument("--use_multi_gpu", action="store_true", help="Launch DistributedDataParallel across multi-GPUs")
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints_hq", help="Directory to save checkpoints")
+    parser.add_argument("--cache", type=str, default=None, help="Path to offline precomputed cache directory")
     return parser.parse_args()
 
 
@@ -43,6 +44,7 @@ def main():
     print("      🚀 FILAMENT-HQ FRAMEWORK v1.0 INITIALIZED        ")
     print("========================================================")
     print(f" Data Root     : {args.data_root}")
+    print(f" Cache Path    : {args.cache or 'None (Online)'}")
     print(f" Backbone      : {args.backbone}")
     print(f" Input Contract: {args.imgsz}x{args.imgsz} (Zero Downsampling)")
     print(f" Stage         : Stage {args.stage}")
@@ -62,6 +64,7 @@ def main():
         use_amp=args.use_amp,
         overfit_single_image=args.overfit_single_image,
         checkpoint_dir=args.checkpoint_dir,
+        cache_dir=args.cache,
     )
 
 

@@ -114,9 +114,14 @@ class FilamentTrainer:
         running_losses = {"total_loss": 0.0, "loss_semantic": 0.0, "loss_boundary": 0.0, "loss_skeleton": 0.0, "loss_instance": 0.0}
 
         pbar = tqdm(self.train_loader, desc=f"Epoch {epoch:03d} [Train]", leave=False)
+        t_data_start = time.time()
+
         for step, batch in enumerate(pbar):
-            images = batch["image"].to(self.device)  # (B, 4, 1024, 1024)
-            batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+            t_data = time.time() - t_data_start
+
+            t_fwd_start = time.time()
+            images = batch["image"].to(self.device, non_blocking=True)  # (B, 4, 1024, 1024)
+            batch = {k: v.to(self.device, non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
             self.optimizer.zero_grad()
 
@@ -124,23 +129,35 @@ class FilamentTrainer:
                 with torch.cuda.amp.autocast():
                     outputs = self.model(images)
                     loss_dict = self.loss_fn(outputs, batch)
+                t_fwd = time.time() - t_fwd_start
+
+                t_bwd_start = time.time()
                 self.scaler.scale(loss_dict["total_loss"]).backward()
                 self.scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
+                t_bwd = time.time() - t_bwd_start
             else:
                 outputs = self.model(images)
                 loss_dict = self.loss_fn(outputs, batch)
+                t_fwd = time.time() - t_fwd_start
+
+                t_bwd_start = time.time()
                 loss_dict["total_loss"].backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.optimizer.step()
+                t_bwd = time.time() - t_bwd_start
+
+            if epoch == 1 and step == 0:
+                print(f"\n[PROFILE Step 1] Data Load: {t_data*1000:.1f}ms | Forward: {t_fwd*1000:.1f}ms | Backward: {t_bwd*1000:.1f}ms")
 
             for k in running_losses:
                 if k in loss_dict:
                     running_losses[k] += loss_dict[k].item()
 
             pbar.set_postfix(total_loss=f"{loss_dict['total_loss'].item():.4f}")
+            t_data_start = time.time()
 
         num_steps = max(len(self.train_loader), 1)
         return {k: v / num_steps for k, v in running_losses.items()}

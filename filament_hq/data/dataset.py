@@ -52,56 +52,69 @@ class FilamentTileDataset(Dataset):
         fg_prob: float = 0.8,
         augment: bool = True,
         overfit_single_image: bool = False,
+        cache_dir: Optional[str | Path] = None,
     ) -> None:
         self.data_root = Path(data_root)
+        self.cache_dir = Path(cache_dir) if cache_dir else (self.data_root if (self.data_root / "index.pkl").exists() else None)
         self.tile_size = tile_size
         self.fg_prob = fg_prob
         self.augment = augment
         self.overfit_single_image = overfit_single_image
         self.preprocessor = SolarPhysicalPreprocessor()
 
-        # Flexible image directory resolution
-        if (self.data_root / "images").exists():
-            self.image_dir = self.data_root / "images"
-        elif (self.data_root / "train_images").exists():
-            self.image_dir = self.data_root / "train_images"
-        elif (self.data_root / "test_images").exists():
-            self.image_dir = self.data_root / "test_images"
+        # Check if loading from precomputed offline cache
+        self.index_meta = None
+        if self.cache_dir and (self.cache_dir / "index.pkl").exists():
+            import pickle
+            index_path = self.cache_dir / "index.pkl"
+            print(f"[Dataset] Loading fast precomputed cache index from: {index_path}")
+            with open(index_path, "rb") as f:
+                self.index_meta = pickle.load(f)["items"]
+            self.image_ids = list(self.index_meta.keys())
+            self.image_files = [Path(v["npy_path"]) for v in self.index_meta.values()]
         else:
-            self.image_dir = self.data_root
+            # Flexible image directory resolution
+            if (self.data_root / "images").exists():
+                self.image_dir = self.data_root / "images"
+            elif (self.data_root / "train_images").exists():
+                self.image_dir = self.data_root / "train_images"
+            elif (self.data_root / "test_images").exists():
+                self.image_dir = self.data_root / "test_images"
+            else:
+                self.image_dir = self.data_root
 
-        self.mask_dir = self.data_root / "masks"
-        exts = [".png", ".jpg", ".jpeg", ".fits"]
+            self.mask_dir = self.data_root / "masks"
+            exts = [".png", ".jpg", ".jpeg", ".fits"]
 
-        self.image_files = sorted(
-            [p for p in self.image_dir.iterdir() if p.is_file() and p.suffix.lower() in exts]
-        )
+            self.image_files = sorted(
+                [p for p in self.image_dir.iterdir() if p.is_file() and p.suffix.lower() in exts]
+            )
 
-        if not self.image_files:
-            raise FileNotFoundError(f"No image files found in '{self.image_dir}'.")
+            if not self.image_files:
+                raise FileNotFoundError(f"No image files found in '{self.image_dir}'.")
 
-        # ── COCO JSON Parsing Support ─────────────────────────────────────
-        self.coco_anns: Dict[str, List[Dict]] = {}
-        json_files = [j for j in (list(self.data_root.glob("*.json")) + list(self.data_root.rglob("*.json"))) if j.name.lower() != "manifest.json"]
-        if json_files:
-            coco_json = json_files[0]
-            try:
-                import json
-                print(f"[Dataset] Parsing COCO annotations from: {coco_json}")
-                with open(coco_json, "r", encoding="utf-8") as f:
-                    coco_data = json.load(f)
-                img_id_map = {
-                    str(img["id"]): (Path(img["file_name"]).stem, img.get("height", 2048), img.get("width", 2048))
-                    for img in coco_data.get("images", [])
-                }
-                for ann in coco_data.get("annotations", []):
-                    c_id = str(ann["image_id"])
-                    if c_id in img_id_map:
-                        stem, h, w = img_id_map[c_id]
-                        self.coco_anns.setdefault(stem, []).append({**ann, "_h": h, "_w": w})
-                print(f"[Dataset] Successfully loaded annotations for {len(self.coco_anns)} image stems.")
-            except Exception as err:
-                print(f"[Dataset WARNING] Failed to parse COCO JSON: {err}")
+            # ── COCO JSON Parsing Support ─────────────────────────────────────
+            self.coco_anns: Dict[str, List[Dict]] = {}
+            json_files = [j for j in (list(self.data_root.glob("*.json")) + list(self.data_root.rglob("*.json"))) if j.name.lower() != "manifest.json"]
+            if json_files:
+                coco_json = json_files[0]
+                try:
+                    import json
+                    print(f"[Dataset] Parsing COCO annotations from: {coco_json}")
+                    with open(coco_json, "r", encoding="utf-8") as f:
+                        coco_data = json.load(f)
+                    img_id_map = {
+                        str(img["id"]): (Path(img["file_name"]).stem, img.get("height", 2048), img.get("width", 2048))
+                        for img in coco_data.get("images", [])
+                    }
+                    for ann in coco_data.get("annotations", []):
+                        c_id = str(ann["image_id"])
+                        if c_id in img_id_map:
+                            stem, h, w = img_id_map[c_id]
+                            self.coco_anns.setdefault(stem, []).append({**ann, "_h": h, "_w": w})
+                    print(f"[Dataset] Successfully loaded annotations for {len(self.coco_anns)} image stems.")
+                except Exception as err:
+                    print(f"[Dataset WARNING] Failed to parse COCO JSON: {err}")
 
         # In-memory preprocessed 4-channel cache
         self._ch4_cache: Dict[str, np.ndarray] = {}
@@ -119,8 +132,14 @@ class FilamentTileDataset(Dataset):
         img_path = self.image_files[real_idx]
         img_id = img_path.stem
 
-        # 1. Retrieve 4-channel image & masks (using in-memory cache if available)
-        if img_id in self._ch4_cache:
+        # 1. Retrieve 4-channel image & masks (using offline npy/npz cache or in-memory cache)
+        if self.index_meta and img_id in self.index_meta:
+            meta = self.index_meta[img_id]
+            ch4_img = np.load(meta["npy_path"]).astype(np.float32)
+            npz_data = np.load(meta["npz_path"])
+            masks_arr = npz_data["masks"]
+            h, w = ch4_img.shape[:2]
+        elif img_id in self._ch4_cache:
             ch4_img = self._ch4_cache[img_id]
             masks_arr = self._mask_cache[img_id]
             h, w = ch4_img.shape[:2]
