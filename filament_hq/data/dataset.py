@@ -64,12 +64,14 @@ class FilamentTileDataset(Dataset):
 
         # Check if loading from precomputed offline cache
         self.index_meta = None
+        self.cache_header = {}
         if self.cache_dir and (self.cache_dir / "index.pkl").exists():
             import pickle
             index_path = self.cache_dir / "index.pkl"
             print(f"[Dataset] Loading fast precomputed cache index from: {index_path}")
             with open(index_path, "rb") as f:
-                self.index_meta = pickle.load(f)["items"]
+                self.cache_header = pickle.load(f)
+                self.index_meta = self.cache_header.get("items", {})
             self.image_ids = list(self.index_meta.keys())
             self.image_files = [Path(v["npy_path"]) for v in self.index_meta.values()]
         else:
@@ -135,7 +137,27 @@ class FilamentTileDataset(Dataset):
         # 1. Retrieve 4-channel image & masks (using offline npy/npz cache or in-memory cache)
         if self.index_meta and img_id in self.index_meta:
             meta = self.index_meta[img_id]
-            ch4_img = np.load(meta["npy_path"]).astype(np.float32)
+            raw_cache = np.load(meta["npy_path"])
+
+            # Support uint8 un-quantization
+            if raw_cache.dtype == np.uint8:
+                raw_cache = raw_cache.astype(np.float32) / 255.0
+            else:
+                raw_cache = raw_cache.astype(np.float32)
+
+            # Support morph_only cache mode (reconstruct full 4 channels)
+            if self.cache_header.get("cache_mode") == "morph_only":
+                orig_path = self.image_dir / f"{img_id}.png"
+                if not orig_path.exists():
+                    orig_path = self.image_dir / f"{img_id}.jpg"
+                img = cv2.imread(str(orig_path), cv2.IMREAD_UNCHANGED)
+                h, w = img.shape[:2]
+                c0 = self.preprocessor._normalize(img)
+                c3 = self.preprocessor._radial_distance_map(h, w)
+                ch4_img = np.dstack([c0, raw_cache[:, :, 0], raw_cache[:, :, 1], c3])
+            else:
+                ch4_img = raw_cache
+
             npz_data = np.load(meta["npz_path"])
             masks_arr = npz_data["masks"]
             h, w = ch4_img.shape[:2]

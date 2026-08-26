@@ -36,7 +36,20 @@ def parse_args():
     parser.add_argument("--output", type=str, default="magfilo_hq_cache", help="Output cache directory")
     parser.add_argument("--tile_size", type=int, default=1024, help="Tile size (default 1024)")
     parser.add_argument("--stride", type=int, default=768, help="Tile stride for indexing (default 768)")
-    parser.add_argument("--dtype", type=str, default="float16", choices=["float16", "float32"], help="Precision for cached 4-channel images")
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default="uint8",
+        choices=["uint8", "float16", "float32"],
+        help="Precision for cached 4-channel images (uint8 uses ~5.6GB, float16 uses ~23.7GB)",
+    )
+    parser.add_argument(
+        "--cache_mode",
+        type=str,
+        default="full",
+        choices=["full", "morph_only"],
+        help="full: cache all 4 channels | morph_only: cache heavy C1 & C2 channels (~2.8GB)",
+    )
     return parser.parse_args()
 
 
@@ -61,6 +74,7 @@ def build_cache():
     exts = [".png", ".jpg", ".jpeg", ".fits"]
     img_files = sorted([p for p in img_dir.iterdir() if p.is_file() and p.suffix.lower() in exts])
     print(f"[CacheBuilder] Found {len(img_files)} images in '{img_dir}'.")
+    print(f" Cache Mode: {args.cache_mode} | Precision: {args.dtype}")
 
     # 2. Parse COCO JSON
     coco_anns: Dict[str, List[Dict]] = {}
@@ -81,12 +95,9 @@ def build_cache():
                 coco_anns.setdefault(stem, []).append({**ann, "_h": h, "_w": w})
 
     preprocessor = SolarPhysicalPreprocessor()
-    target_dtype = np.float16 if args.dtype == "float16" else np.float32
-
-    index_metadata = {}
     start_time = time.time()
 
-    print(f"[CacheBuilder] Building FP16 4-channel cache & mask NPZ files to '{output_dir}'...")
+    print(f"[CacheBuilder] Building dataset cache to '{output_dir}'...")
 
     for img_path in tqdm(img_files, desc="Caching Dataset"):
         stem = img_path.stem
@@ -97,7 +108,18 @@ def build_cache():
         h_img, w_img = raw_img.shape[:2]
 
         # 1. 4-Channel Preprocessing
-        ch4_img = preprocessor(raw_img).astype(target_dtype)  # (H, W, 4)
+        ch4_img = preprocessor(raw_img)  # (H, W, 4) float32 [0, 1]
+
+        if args.cache_mode == "morph_only":
+            ch4_img = ch4_img[:, :, 1:3]  # Keep only C1 (contrast) & C2 (blackhat)
+
+        if args.dtype == "uint8":
+            ch4_img = (np.clip(ch4_img, 0.0, 1.0) * 255.0).astype(np.uint8)
+        elif args.dtype == "float16":
+            ch4_img = ch4_img.astype(np.float16)
+        else:
+            ch4_img = ch4_img.astype(np.float32)
+
         np.save(img_out_dir / f"{stem}.npy", ch4_img)
 
         # 2. Instance Mask Rasterization
