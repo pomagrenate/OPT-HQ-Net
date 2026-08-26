@@ -132,6 +132,9 @@ class HookedFeatureExtractor(nn.Module):
                 hf_id = f"nvidia/mit-b{b_num}"
                 print(f"[HookedFeatureExtractor] Loading HuggingFace SegFormer model: '{hf_id}'...")
                 self.model = SegformerModel.from_pretrained(hf_id)
+                if hasattr(self.model, "gradient_checkpointing_enable"):
+                    self.model.gradient_checkpointing_enable()
+                    print("[HookedFeatureExtractor] Enabled HuggingFace Gradient Checkpointing (saves ~60% VRAM).")
                 self.is_hf_segformer = True
                 return
             except Exception as hf_err:
@@ -184,7 +187,11 @@ class HookedFeatureExtractor(nn.Module):
     def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
         if self.is_hf_segformer:
             outputs = self.model(pixel_values=x, output_hidden_states=True)
-            return list(outputs.hidden_states)
+            hs = list(outputs.hidden_states)
+            # HF SegformerModel returns (embedding_output, stage1, stage2, stage3, stage4)
+            if len(hs) == 5:
+                return hs[1:]
+            return hs
 
         self.captured_features = []
         try:
@@ -286,6 +293,12 @@ class BackboneWithFPN(nn.Module):
                 print("[Backbone] Enabled Gradient Checkpointing on underlying model.")
             except Exception:
                 pass
+        elif hasattr(getattr(self.backbone, "model", None), "gradient_checkpointing_enable"):
+            try:
+                self.backbone.model.gradient_checkpointing_enable()
+                print("[Backbone] Enabled HuggingFace Gradient Checkpointing on underlying SegFormer model.")
+            except Exception:
+                pass
 
         self.fpn = FPNNeck(self.in_channels_list, out_channels)
         self.out_channels = out_channels
@@ -299,6 +312,16 @@ class BackboneWithFPN(nn.Module):
                 print(f"[Backbone] Gradient Checkpointing set to: {enable}")
             except Exception as e:
                 print(f"[Backbone WARNING] Failed to set gradient checkpointing: {e}")
+        elif hasattr(target, "gradient_checkpointing_enable"):
+            try:
+                if enable:
+                    target.gradient_checkpointing_enable()
+                    print(f"[Backbone] HuggingFace Gradient Checkpointing ENABLED.")
+                else:
+                    target.gradient_checkpointing_disable()
+                    print(f"[Backbone] HuggingFace Gradient Checkpointing DISABLED.")
+            except Exception as e:
+                print(f"[Backbone WARNING] Failed to set HF gradient checkpointing: {e}")
 
     # ------------------------------------------------------------------
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
