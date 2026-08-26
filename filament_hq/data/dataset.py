@@ -240,6 +240,7 @@ class FilamentTileDataset(Dataset):
             "boundary": bnd_tensor,        # (1, 1024, 1024)
             "skeleton": skl_tensor,        # (1, 1024, 1024)
             "instances": inst_tensor,      # (N, 1024, 1024)
+            "instance_masks": inst_tensor, # (N, 1024, 1024) for validator audit
             "image_id": img_id,
         }
 
