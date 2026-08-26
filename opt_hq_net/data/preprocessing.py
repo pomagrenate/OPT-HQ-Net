@@ -178,11 +178,6 @@ class CLAHEPreprocessor:
         self.tile_grid_size = tile_grid_size
         self.bit_depth = bit_depth
 
-        self._clahe = cv2.createCLAHE(
-            clipLimit=clip_limit,
-            tileGridSize=tile_grid_size,
-        )
-
     # ------------------------------------------------------------------
     def __call__(self, image: np.ndarray) -> np.ndarray:
         """
@@ -201,7 +196,11 @@ class CLAHEPreprocessor:
             Float32 array, shape (H, W, 3), values in [0, 1].
         """
         gray = self._to_gray_uint8(image)
-        enhanced = self._clahe.apply(gray)
+        clahe = cv2.createCLAHE(
+            clipLimit=self.clip_limit,
+            tileGridSize=self.tile_grid_size,
+        )
+        enhanced = clahe.apply(gray)
 
         # Normalise to float32 [0, 1]
         normalised = enhanced.astype(np.float32) / 255.0

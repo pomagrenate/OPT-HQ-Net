@@ -338,18 +338,40 @@ class BackboneFactory:
                 last_err = err
                 continue
 
-        # If none of the candidates worked, attempt fuzzy search in timm
+        # If none of the candidates worked, attempt fuzzy search within the requested family
         if TIMM_AVAILABLE:
             clean_name = name.lower().replace("-", "_")
-            search_terms = [clean_name, clean_name.split("_")[0], "mix_transformer", "mit", "segformer", "hrnet"]
+            family_prefix = clean_name.split("_")[0]
+            search_terms = [clean_name, family_prefix]
+            if "segformer" in clean_name or "mit" in clean_name:
+                search_terms.extend(["mix_transformer", "segformer", "mit"])
+            elif "hrnet" in clean_name:
+                search_terms.extend(["hrnet"])
+            elif "swin" in clean_name:
+                search_terms.extend(["swin"])
+            elif "convnext" in clean_name:
+                search_terms.extend(["convnext"])
+
             for term in search_terms:
                 matches = timm.list_models(f"*{term}*")
-                if matches:
-                    print(f"[BackboneFactory WARNING] '{name}' failed. Automatically falling back to timm model: '{matches[0]}'")
-                    return BackboneWithFPN(
-                        model_name=matches[0],
-                        pretrained=pretrained,
-                        out_channels=out_channels,
-                        out_indices=out_indices,
-                    )
-        raise last_err
+                for match in matches:
+                    try:
+                        print(f"[BackboneFactory] Trying timm model: '{match}' for requested backbone '{name}'...")
+                        return BackboneWithFPN(
+                            model_name=match,
+                            pretrained=pretrained,
+                            out_channels=out_channels,
+                            out_indices=out_indices,
+                        )
+                    except Exception:
+                        continue
+
+        raise ValueError(
+            f"Backbone '{name}' is not supported by timm for multi-scale feature extraction (features_only=True).\n"
+            f"Supported high-performance backbones:\n"
+            f"  - --backbone swin_tiny    (Swin Transformer)\n"
+            f"  - --backbone convnext_tiny (ConvNeXt-Tiny)\n"
+            f"  - --backbone hrnet_w18    (High-Resolution Net W18)\n"
+            f"  - --backbone hrnet_w32    (High-Resolution Net W32)\n"
+            f"Original error: {last_err}"
+        )
