@@ -104,12 +104,80 @@ class FPNNeck(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Dynamic Forward-Hook Feature Extractor (Fallback for SegFormer / ViT)
+# ---------------------------------------------------------------------------
+
+class HookedFeatureExtractor(nn.Module):
+    """
+    Generic feature extractor wrapper using PyTorch forward hooks.
+    Extracts 4 multi-scale feature maps from any timm model (e.g. SegFormer / MixTransformer)
+    that lacks native ``features_only=True`` support.
+    """
+
+    def __init__(self, model_name: str, pretrained: bool = True):
+        super().__init__()
+        self.model = timm.create_model(model_name, pretrained=pretrained)
+        self.captured_features: List[torch.Tensor] = []
+        self.hooks = []
+
+        named_modules = dict(self.model.named_modules())
+        target_names = []
+
+        possible_patterns = [
+            ["norm1", "norm2", "norm3", "norm4"],
+            ["block1", "block2", "block3", "block4"],
+            ["stage1", "stage2", "stage3", "stage4"],
+            ["stages.0", "stages.1", "stages.2", "stages.3"],
+            ["blocks.0", "blocks.1", "blocks.2", "blocks.3"],
+        ]
+        for pattern in possible_patterns:
+            if all(p in named_modules for p in pattern):
+                target_names = pattern
+                break
+
+        if not target_names:
+            stage_candidates = [
+                k for k, v in named_modules.items()
+                if any(term in k.lower() for term in ["norm", "block", "stage", "layer"])
+                and not "." in k
+            ]
+            if len(stage_candidates) >= 4:
+                step = max(1, len(stage_candidates) // 4)
+                target_names = [stage_candidates[i * step] for i in range(4)]
+
+        if not target_names:
+            all_keys = [k for k in named_modules.keys() if k]
+            step = max(1, len(all_keys) // 4)
+            target_names = [all_keys[i * step] for i in range(1, 5) if i * step < len(all_keys)]
+
+        self.target_names = target_names
+        for name in self.target_names:
+            mod = named_modules[name]
+            self.hooks.append(mod.register_forward_hook(self._make_hook()))
+
+    def _make_hook(self):
+        def hook(module, input, output):
+            val = output[0] if isinstance(output, (tuple, list)) else output
+            if isinstance(val, torch.Tensor):
+                self.captured_features.append(val)
+        return hook
+
+    def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
+        self.captured_features = []
+        try:
+            _ = self.model(x)
+        except Exception:
+            pass
+        return self.captured_features
+
+
+# ---------------------------------------------------------------------------
 # Backbone wrapper — feature extraction via timm
 # ---------------------------------------------------------------------------
 
 class BackboneWithFPN(nn.Module):
     """
-    timm backbone (ConvNeXt-L or Swin-L) paired with an FPN neck.
+    timm backbone paired with an FPN neck.
 
     Parameters
     ----------
@@ -152,20 +220,35 @@ class BackboneWithFPN(nn.Module):
             "out_indices": out_indices,
         }
 
-        # For Vision Transformers (Swin, ViT), allow arbitrary input resolutions (e.g. 512x512)
         if "swin" in model_name.lower() or "vit" in model_name.lower():
             create_kwargs["strict_img_size"] = False
             create_kwargs["dynamic_img_pad"] = True
 
         # Create feature extractor (returns list of feature maps)
+        self.is_hooked = False
         try:
             self.backbone = timm.create_model(model_name, **create_kwargs)
-        except TypeError:
-            create_kwargs.pop("dynamic_img_pad", None)
-            self.backbone = timm.create_model(model_name, **create_kwargs)
-
-        # Query the actual channel widths produced by the backbone
-        self.in_channels_list: List[int] = self.backbone.feature_info.channels()
+            self.in_channels_list: List[int] = self.backbone.feature_info.channels()
+        except Exception as err:
+            # Fallback: create base model and attach forward hooks (enables native SegFormer support)
+            print(f"[Backbone] 'features_only=True' not natively supported for '{model_name}' ({err}). Enabling Hooked Feature Extraction...")
+            self.backbone = HookedFeatureExtractor(model_name, pretrained=pretrained)
+            self.is_hooked = True
+            
+            # Infer feature channels via a single dummy pass
+            with torch.no_grad():
+                dummy_x = torch.zeros(1, 3, 224, 224)
+                dummy_feats = self.backbone(dummy_x)
+                self.in_channels_list = []
+                for f in dummy_feats:
+                    if f.ndim == 4:
+                        # NCHW vs NHWC channel check
+                        c = f.shape[1] if f.shape[1] <= f.shape[-1] else f.shape[-1]
+                        self.in_channels_list.append(c)
+                    elif f.ndim == 3:
+                        self.in_channels_list.append(f.shape[-1])
+                if not self.in_channels_list:
+                    raise RuntimeError(f"HookedFeatureExtractor failed to capture feature maps for model '{model_name}'.")
 
         # Enable gradient checkpointing to save up to 60% activation VRAM
         if hasattr(self.backbone, "set_grad_checkpointing"):
@@ -174,15 +257,22 @@ class BackboneWithFPN(nn.Module):
                 print("[Backbone] Enabled Gradient Checkpointing (saves ~60% VRAM during backward pass)")
             except Exception as e:
                 pass
+        elif hasattr(getattr(self.backbone, "model", None), "set_grad_checkpointing"):
+            try:
+                self.backbone.model.set_grad_checkpointing(True)
+                print("[Backbone] Enabled Gradient Checkpointing on underlying model.")
+            except Exception:
+                pass
 
         self.fpn = FPNNeck(self.in_channels_list, out_channels)
         self.out_channels = out_channels
 
     def set_grad_checkpointing(self, enable: bool = True) -> None:
         """Enable or disable gradient checkpointing on the underlying timm backbone."""
-        if hasattr(self.backbone, "set_grad_checkpointing"):
+        target = self.backbone if not self.is_hooked else getattr(self.backbone, "model", self.backbone)
+        if hasattr(target, "set_grad_checkpointing"):
             try:
-                self.backbone.set_grad_checkpointing(enable)
+                target.set_grad_checkpointing(enable)
                 print(f"[Backbone] Gradient Checkpointing set to: {enable}")
             except Exception as e:
                 print(f"[Backbone WARNING] Failed to set gradient checkpointing: {e}")
@@ -202,12 +292,17 @@ class BackboneWithFPN(nn.Module):
         """
         features: List[torch.Tensor] = self.backbone(x)
 
-        # Swin Transformer and Vision Transformers in timm output NHWC tensors (B, H, W, C).
-        # Standard CNN backbones output NCHW tensors (B, C, H, W).
-        # Permute NHWC -> NCHW so FPN 2D convolutions receive channels in dim 1.
+        # Swin Transformer, SegFormer, and ViT models in timm may output NHWC or token sequence tensors.
+        # Permute/reshape to NCHW so FPN 2D convolutions receive channels in dim 1.
         formatted_features = []
         for i, feat in enumerate(features):
-            if feat.ndim == 4:
+            if feat.ndim == 3:
+                # Reshape (B, L, C) -> (B, C, H, W) assuming square spatial grid
+                b, l, c = feat.shape
+                h = w = int(l ** 0.5)
+                if h * w == l:
+                    feat = feat.permute(0, 2, 1).reshape(b, c, h, w).contiguous()
+            elif feat.ndim == 4:
                 expected_c = self.in_channels_list[i] if i < len(self.in_channels_list) else None
                 if expected_c is not None and feat.shape[1] != expected_c and feat.shape[-1] == expected_c:
                     feat = feat.permute(0, 3, 1, 2).contiguous()
