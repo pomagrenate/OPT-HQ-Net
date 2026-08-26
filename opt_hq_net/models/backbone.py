@@ -257,25 +257,25 @@ class BackboneFactory:
         "swin-base": "swin_base_patch4_window7_224",
         "swin_large": "swin_large_patch4_window7_224",
         "swin-large": "swin_large_patch4_window7_224",
-        # SegFormer (MixTransformer) backbones
-        "segformer_b0": "mit_b0",
-        "segformer-b0": "mit_b0",
-        "segformer_b1": "mit_b1",
-        "segformer-b1": "mit_b1",
-        "segformer_b2": "mit_b2",
-        "segformer-b2": "mit_b2",
-        "segformer_b3": "mit_b3",
-        "segformer-b3": "mit_b3",
-        "segformer_b4": "mit_b4",
-        "segformer-b4": "mit_b4",
-        "segformer_b5": "mit_b5",
-        "segformer-b5": "mit_b5",
-        "mit_b0": "mit_b0",
-        "mit_b1": "mit_b1",
-        "mit_b2": "mit_b2",
-        "mit_b3": "mit_b3",
-        "mit_b4": "mit_b4",
-        "mit_b5": "mit_b5",
+        # SegFormer (MixTransformer) backbones in timm
+        "segformer_b0": "segformer_b0",
+        "segformer-b0": "segformer_b0",
+        "segformer_b1": "segformer_b1",
+        "segformer-b1": "segformer_b1",
+        "segformer_b2": "segformer_b2",
+        "segformer-b2": "segformer_b2",
+        "segformer_b3": "segformer_b3",
+        "segformer-b3": "segformer_b3",
+        "segformer_b4": "segformer_b4",
+        "segformer-b4": "segformer_b4",
+        "segformer_b5": "segformer_b5",
+        "segformer-b5": "segformer_b5",
+        "mit_b0": "segformer_b0",
+        "mit_b1": "segformer_b1",
+        "mit_b2": "segformer_b2",
+        "mit_b3": "segformer_b3",
+        "mit_b4": "segformer_b4",
+        "mit_b5": "segformer_b5",
         # HRNet backbones
         "hrnet_w18": "hrnet_w18",
         "hrnet-w18": "hrnet_w18",
@@ -309,9 +309,27 @@ class BackboneFactory:
         """
         resolved = cls._ALIASES.get(name.lower(), name)
         
-        return BackboneWithFPN(
-            model_name=resolved,
-            pretrained=pretrained,
-            out_channels=out_channels,
-            out_indices=out_indices,
-        )
+        try:
+            return BackboneWithFPN(
+                model_name=resolved,
+                pretrained=pretrained,
+                out_channels=out_channels,
+                out_indices=out_indices,
+            )
+        except Exception as err:
+            if TIMM_AVAILABLE:
+                # Attempt to search timm for fuzzy matching model names
+                clean_name = name.lower().replace("-", "_")
+                matches = timm.list_models(f"*{clean_name}*")
+                if not matches:
+                    prefix = clean_name.split("_")[0]
+                    matches = timm.list_models(f"*{prefix}*")
+                if matches:
+                    print(f"[BackboneFactory WARNING] Model '{resolved}' failed ({err}). Automatically falling back to timm model: '{matches[0]}'")
+                    return BackboneWithFPN(
+                        model_name=matches[0],
+                        pretrained=pretrained,
+                        out_channels=out_channels,
+                        out_indices=out_indices,
+                    )
+            raise err
