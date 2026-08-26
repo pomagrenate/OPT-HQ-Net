@@ -109,16 +109,35 @@ class FPNNeck(nn.Module):
 
 class HookedFeatureExtractor(nn.Module):
     """
-    Generic feature extractor wrapper using PyTorch forward hooks.
-    Extracts 4 multi-scale feature maps from any timm model (e.g. SegFormer / MixTransformer)
-    that lacks native ``features_only=True`` support.
+    Generic feature extractor wrapper using PyTorch forward hooks or HuggingFace SegFormer.
+    Extracts 4 multi-scale feature maps from any timm or HuggingFace model (e.g. SegFormer / MixTransformer)
+    that lacks native ``features_only=True`` support in timm.
     """
 
     def __init__(self, model_name: str, pretrained: bool = True):
         super().__init__()
-        self.model = timm.create_model(model_name, pretrained=pretrained)
         self.captured_features: List[torch.Tensor] = []
         self.hooks = []
+        self.is_hf_segformer = False
+
+        # Attempt native HuggingFace SegFormer loading if SegFormer/mit is requested
+        if any(term in model_name.lower() for term in ["segformer", "mit", "mix_transformer"]):
+            try:
+                from transformers import SegformerModel
+                b_num = "2"
+                for sub in ["b0", "b1", "b2", "b3", "b4", "b5"]:
+                    if sub in model_name.lower():
+                        b_num = sub[-1]
+                        break
+                hf_id = f"nvidia/mit-b{b_num}"
+                print(f"[HookedFeatureExtractor] Loading HuggingFace SegFormer model: '{hf_id}'...")
+                self.model = SegformerModel.from_pretrained(hf_id)
+                self.is_hf_segformer = True
+                return
+            except Exception as hf_err:
+                print(f"[HookedFeatureExtractor WARNING] HuggingFace SegFormer failed: {hf_err}. Trying timm hooked extraction...")
+
+        self.model = timm.create_model(model_name, pretrained=pretrained)
 
         named_modules = dict(self.model.named_modules())
         target_names = []
@@ -163,6 +182,10 @@ class HookedFeatureExtractor(nn.Module):
         return hook
 
     def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
+        if self.is_hf_segformer:
+            outputs = self.model(pixel_values=x, output_hidden_states=True)
+            return list(outputs.hidden_states)
+
         self.captured_features = []
         try:
             _ = self.model(x)
