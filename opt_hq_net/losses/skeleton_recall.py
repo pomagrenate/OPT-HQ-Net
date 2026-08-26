@@ -55,7 +55,7 @@ class SkeletonRecallLoss(nn.Module):
         Numerical stability constant added to the denominator.
     """
 
-    def __init__(self, eps: float = 1e-6) -> None:
+    def __init__(self, eps: float = 1e-5) -> None:
         super().__init__()
         self.eps = eps
 
@@ -85,7 +85,8 @@ class SkeletonRecallLoss(nn.Module):
         if pred_logits.dim() == 4:
             pred_logits = pred_logits.squeeze(1)   # (N, H, W)
 
-        pred_prob = torch.sigmoid(pred_logits)      # ŷ ∈ [0,1]
+        pred_logits_clamped = torch.clamp(pred_logits, min=-10.0, max=10.0)
+        pred_prob = torch.sigmoid(pred_logits_clamped)      # ŷ ∈ [0,1]
 
         N = pred_prob.shape[0]
         if N == 0:
@@ -107,6 +108,7 @@ class SkeletonRecallLoss(nn.Module):
 
             # Recall along skeleton pixels
             recall = (skeleton_mask.float() * pred_i).sum() / (n_skel + self.eps)
+            recall = torch.clamp(recall, min=0.0, max=1.0)
             loss_sum = loss_sum + (1.0 - recall)
 
         return loss_sum / max(N, 1)

@@ -44,10 +44,10 @@ class FocalTverskyLoss(nn.Module):
 
     def __init__(
         self,
-        alpha: float = 0.3,
-        beta: float = 0.7,
+        alpha: float = 0.5,
+        beta: float = 0.5,
         gamma: float = 0.75,
-        smooth: float = 1e-6,
+        smooth: float = 1e-5,
         from_logits: bool = True,
     ) -> None:
         super().__init__()
@@ -72,9 +72,10 @@ class FocalTverskyLoss(nn.Module):
             Focal-Tversky loss value.
         """
         if self.from_logits:
-            probs = torch.sigmoid(logits)
+            logits_clamped = torch.clamp(logits, min=-10.0, max=10.0)
+            probs = torch.sigmoid(logits_clamped)
         else:
-            probs = logits
+            probs = torch.clamp(logits, min=1e-7, max=1.0 - 1e-7)
 
         # Ensure matching shapes and float dtype
         probs = probs.squeeze(1) if probs.ndim == 4 and probs.shape[1] == 1 else probs
