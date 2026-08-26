@@ -87,18 +87,27 @@ def parse_args() -> argparse.Namespace:
 
 
 # ---------------------------------------------------------------------------
-# Main
+# ---------------------------------------------------------------------------
+# Worker for DistributedDataParallel (DDP)
 # ---------------------------------------------------------------------------
 
-def main() -> None:
-    args = parse_args()
+def run_ddp_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
+    import os
+    import torch.distributed as dist
+    from torch.utils.data.distributed import DistributedSampler
 
-    # ── Build configs ────────────────────────────────────────────────────
+    # 1. Initialize DDP Process Group
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "12355"
+    backend = "nccl" if dist.is_nccl_available() else "gloo"
+    dist.init_process_group(backend, rank=rank, world_size=world_size)
+    torch.cuda.set_device(rank)
+
+    # 2. Build configs
     model_cfg = ModelConfig(
         backbone_name=args.backbone,
         backbone_pretrained=not args.no_pretrained,
     )
-
     model_cfg.rpn.score_threshold = args.score_thresh
 
     train_cfg = TrainingConfig(
@@ -109,7 +118,117 @@ def main() -> None:
         weight_decay=args.weight_decay,
         warmup_epochs=args.warmup_epochs,
         use_amp=not args.no_amp,
-        use_multi_gpu=args.use_multi_gpu,
+        use_multi_gpu=True,
+        checkpoint_dir=args.checkpoint_dir,
+        device=f"cuda:{rank}",
+        grad_checkpointing=not args.no_grad_ckpt,
+        val_subset=args.val_subset,
+        val_every_n_epochs=args.val_every,
+    )
+    train_cfg.loss_weights.oriented_box = args.lambda_box
+    train_cfg.loss_weights.focal        = args.lambda_focal
+    train_cfg.loss_weights.dice         = args.lambda_dice
+    train_cfg.loss_weights.skeleton     = args.lambda_skeleton
+
+    # 3. Build model
+    if rank == 0:
+        print(f"[DDP Rank 0] Building OPT-HQ Net with backbone: {model_cfg.backbone_name}")
+    model = OPTHQNetBuilder(model_cfg).build()
+
+    # 4. Build Datasets & DistributedSampler
+    data_root_path = Path(args.data_root)
+    train_path = data_root_path / "train" if (data_root_path / "train").exists() else data_root_path
+
+    val_ds = None
+    if (data_root_path / "val").exists():
+        candidate_val = SolarFilamentDataset(
+            data_root=data_root_path / "val",
+            augment=False,
+            target_size=args.target_size,
+        )
+        if candidate_val.has_masks:
+            val_ds = candidate_val
+
+    if val_ds is not None:
+        train_ds = SolarFilamentDataset(
+            data_root=train_path,
+            augment=True,
+            target_size=args.target_size,
+            patch_size=args.patch_size,
+            fg_patch_prob=args.fg_patch_prob,
+        )
+    else:
+        full_train_ds = SolarFilamentDataset(
+            data_root=train_path,
+            augment=True,
+            target_size=args.target_size,
+        )
+        full_val_ds = SolarFilamentDataset(
+            data_root=train_path,
+            augment=False,
+            target_size=args.target_size,
+        )
+        val_size = max(1, int(0.2 * len(full_train_ds)))
+        train_size = len(full_train_ds) - val_size
+        generator = torch.Generator().manual_seed(42)
+        indices = torch.randperm(len(full_train_ds), generator=generator).tolist()
+        train_indices, val_indices = indices[val_size:], indices[:val_size]
+
+        train_ds = torch.utils.data.Subset(full_train_ds, train_indices)
+        val_ds = torch.utils.data.Subset(full_val_ds, val_indices)
+
+    train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True)
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=train_cfg.batch_size,
+        sampler=train_sampler,
+        num_workers=train_cfg.num_workers,
+        collate_fn=collate_fn,
+        pin_memory=True,
+        persistent_workers=(train_cfg.num_workers > 0),
+        prefetch_factor=2 if train_cfg.num_workers > 0 else None,
+    )
+
+    val_loader = None
+    if rank == 0:
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=1,
+            shuffle=False,
+            num_workers=train_cfg.num_workers,
+            collate_fn=collate_fn,
+            pin_memory=True,
+            persistent_workers=(train_cfg.num_workers > 0),
+            prefetch_factor=2 if train_cfg.num_workers > 0 else None,
+        )
+
+    trainer = Trainer(model, train_loader, val_loader, train_cfg, rank=rank, world_size=world_size)
+    trainer.train()
+
+    dist.destroy_process_group()
+
+
+# ---------------------------------------------------------------------------
+# Single Process / Single GPU execution
+# ---------------------------------------------------------------------------
+
+def run_single_process(args: argparse.Namespace) -> None:
+    model_cfg = ModelConfig(
+        backbone_name=args.backbone,
+        backbone_pretrained=not args.no_pretrained,
+    )
+    model_cfg.rpn.score_threshold = args.score_thresh
+
+    train_cfg = TrainingConfig(
+        num_epochs=args.epochs,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        learning_rate=args.lr,
+        weight_decay=args.weight_decay,
+        warmup_epochs=args.warmup_epochs,
+        use_amp=not args.no_amp,
+        use_multi_gpu=False,
         checkpoint_dir=args.checkpoint_dir,
         device=args.device,
         grad_checkpointing=not args.no_grad_ckpt,
@@ -122,19 +241,14 @@ def main() -> None:
     train_cfg.loss_weights.dice         = args.lambda_dice
     train_cfg.loss_weights.skeleton     = args.lambda_skeleton
 
-    # ── Build model ──────────────────────────────────────────────────────
     print(f"[Main] Building OPT-HQ Net with backbone: {model_cfg.backbone_name}")
     model = OPTHQNetBuilder(model_cfg).build()
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[Main] Trainable parameters: {n_params / 1e6:.1f}M")
 
-    # ── Build datasets ───────────────────────────────────────────────────
     data_root_path = Path(args.data_root)
-    if (data_root_path / "train").exists():
-        train_path = data_root_path / "train"
-    else:
-        train_path = data_root_path
+    train_path = data_root_path / "train" if (data_root_path / "train").exists() else data_root_path
 
     print(f"[Main] Loading train dataset from: {train_path}")
 
@@ -158,7 +272,6 @@ def main() -> None:
             fg_patch_prob=args.fg_patch_prob,
         )
     else:
-        # Fallback: Create an 80/20 train/val split from train_path for true validation
         full_train_ds = SolarFilamentDataset(
             data_root=train_path,
             augment=True,
@@ -169,7 +282,6 @@ def main() -> None:
             augment=False,
             target_size=args.target_size,
         )
-
         val_size = max(1, int(0.2 * len(full_train_ds)))
         train_size = len(full_train_ds) - val_size
 
@@ -207,9 +319,24 @@ def main() -> None:
 
     print(f"[Main] Train: {len(train_ds)} images | Val: {len(val_ds)} images")
 
-    # ── Train ────────────────────────────────────────────────────────────
     trainer = Trainer(model, train_loader, val_loader, train_cfg)
     trainer.train()
+
+
+# ---------------------------------------------------------------------------
+# Main Entry Point
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    args = parse_args()
+    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+
+    if args.use_multi_gpu and num_gpus > 1:
+        import torch.multiprocessing as mp
+        print(f"[Main] Launching DistributedDataParallel (DDP) across {num_gpus} GPUs...")
+        mp.spawn(run_ddp_worker, args=(num_gpus, args), nprocs=num_gpus, join=True)
+    else:
+        run_single_process(args)
 
 
 if __name__ == "__main__":

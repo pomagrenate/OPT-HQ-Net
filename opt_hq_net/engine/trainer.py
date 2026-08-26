@@ -69,6 +69,8 @@ class Trainer:
         train_loader: DataLoader,
         val_loader: Optional[DataLoader],
         cfg: TrainingConfig,
+        rank: int = 0,
+        world_size: int = 1,
     ) -> None:
         # Optimise CUDA memory allocation to prevent fragmentation OOM
         os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -77,17 +79,24 @@ class Trainer:
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.cfg = cfg
+        self.rank = rank
+        self.world_size = world_size
+        self.is_master = (rank == 0)
 
-        # Device validation with sm_60 compatibility check
-        if cfg.device.startswith("cuda") and torch.cuda.is_available():
+        # Device setup
+        if world_size > 1 and torch.cuda.is_available():
+            self.device = torch.device(f"cuda:{rank}")
+            torch.cuda.set_device(self.device)
+        elif cfg.device.startswith("cuda") and torch.cuda.is_available():
             try:
                 dummy = torch.zeros((1, 1), device=cfg.device)
                 dummy = dummy + 1.0
                 self.device = torch.device(cfg.device)
             except Exception as err:
-                print(f"\n[Trainer WARNING] CUDA execution test failed: {err}")
-                print("[Trainer HINT] Tesla P100 (sm_60) is not supported by PyTorch 2.4+ builds.")
-                print("              In Kaggle Notebook settings -> 'Accelerator', change GPU from 'P100' to 'GPU T4 x2' (sm_75).\n")
+                if self.is_master:
+                    print(f"\n[Trainer WARNING] CUDA execution test failed: {err}")
+                    print("[Trainer HINT] Tesla P100 (sm_60) is not supported by PyTorch 2.4+ builds.")
+                    print("              In Kaggle Notebook settings -> 'Accelerator', change GPU from 'P100' to 'GPU T4 x2' (sm_75).\n")
                 self.device = torch.device("cpu")
         else:
             self.device = torch.device("cpu")
@@ -96,24 +105,30 @@ class Trainer:
         if self.device.type == "cuda":
             torch.backends.cudnn.benchmark = True
 
-        # Multi-GPU support (DataParallel) — disabled by default to avoid list target scattering bugs
+        # Multi-GPU support: DistributedDataParallel (DDP) for multi-process or DataParallel fallback
         self.num_gpus = torch.cuda.device_count() if self.device.type == "cuda" else 0
-        if self.num_gpus > 1 and getattr(cfg, "use_multi_gpu", False):
+        if world_size > 1:
+            from torch.nn.parallel import DistributedDataParallel as DDP
+            self.model = DDP(self.model, device_ids=[rank], find_unused_parameters=True)
+            self.is_multi_gpu = True
+            if self.is_master:
+                print(f"[Trainer] DistributedDataParallel (DDP) active across {world_size} GPUs!")
+        elif self.num_gpus > 1 and getattr(cfg, "use_multi_gpu", False):
             print(f"[Trainer] Multi-GPU setup detected: {self.num_gpus} GPUs available. Enabling nn.DataParallel!")
             self.model = nn.DataParallel(self.model)
             self.is_multi_gpu = True
         else:
-            print(f"[Trainer] Single GPU execution on device: {self.device} (VRAM efficient mode)")
+            if self.is_master:
+                print(f"[Trainer] Single GPU / process execution on device: {self.device} (VRAM efficient mode)")
             self.is_multi_gpu = False
 
         # Configure gradient checkpointing on backbone
-        raw_model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+        raw_model = self.model.module if hasattr(self.model, "module") else self.model
         if hasattr(raw_model, "backbone") and hasattr(raw_model.backbone, "set_grad_checkpointing"):
             enable_gc = getattr(cfg, "grad_checkpointing", True)
             raw_model.backbone.set_grad_checkpointing(enable_gc)
 
         # Optimiser
-        raw_model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
         self.optimizer = AdamW(
             raw_model.parameters(),
             lr=cfg.learning_rate,
@@ -166,42 +181,47 @@ class Trainer:
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
 
-        print(f"[Trainer] Starting training on device: {self.device}")
-        print(f"[Trainer] AMP enabled: {self.use_amp}")
-        print(f"[Trainer] Multi-GPU active: {self.is_multi_gpu} ({self.num_gpus} GPUs detected)")
-        print(f"[Trainer] Epochs: {self.cfg.num_epochs}")
-        print(f"[Trainer] Batch size: {self.cfg.batch_size} (Grad Accum Steps: {getattr(self.cfg, 'gradient_accumulation_steps', 1)})")
+        if self.is_master:
+            print(f"[Trainer] Starting training on device: {self.device}")
+            print(f"[Trainer] AMP enabled: {self.use_amp}")
+            print(f"[Trainer] Multi-GPU active: {self.is_multi_gpu} ({self.num_gpus} GPUs detected)")
+            print(f"[Trainer] Epochs: {self.cfg.num_epochs}")
+            print(f"[Trainer] Batch size: {self.cfg.batch_size} (Grad Accum Steps: {getattr(self.cfg, 'gradient_accumulation_steps', 1)})")
 
         for epoch in range(1, self.cfg.num_epochs + 1):
             train_losses = self._train_one_epoch(epoch)
             self.scheduler.step()
 
-            # Validation
+            # Validation (only on master process in DDP)
             val_every = getattr(self.cfg, "val_every_n_epochs", 1)
-            if self.val_loader is not None and (epoch % val_every == 0):
+            val_metrics = {}
+            if self.is_master and self.val_loader is not None and (epoch % val_every == 0):
                 val_metrics = self._validate(epoch)
                 pq = val_metrics.get("PQ", 0.0)
                 if pq > self._best_pq:
                     self._best_pq = pq
                     self._save_checkpoint(epoch, tag="best")
                     print(f"  ✓ New best PQ: {pq:.4f}")
-            else:
-                val_metrics = {}
 
-            # Periodic checkpoint
-            if epoch % self.cfg.save_every_n_epochs == 0:
+            # Periodic checkpoint (master process only)
+            if self.is_master and epoch % self.cfg.save_every_n_epochs == 0:
                 self._save_checkpoint(epoch)
 
-            self._log_epoch(epoch, train_losses, val_metrics)
+            if self.is_master:
+                self._log_epoch(epoch, train_losses, val_metrics)
             if self.device.type == "cuda":
                 torch.cuda.empty_cache()
 
-        print(f"[Trainer] Training complete. Best PQ: {self._best_pq:.4f}")
+        if self.is_master:
+            print(f"[Trainer] Training complete. Best PQ: {self._best_pq:.4f}")
 
     # ------------------------------------------------------------------
     def _train_one_epoch(self, epoch: int) -> Dict[str, float]:
         """Single training epoch with gradient accumulation. Returns averaged loss values."""
         self.model.train()
+        if hasattr(self.train_loader, "sampler") and hasattr(self.train_loader.sampler, "set_epoch"):
+            self.train_loader.sampler.set_epoch(epoch)
+
         total_losses: Dict[str, float] = {}
         num_batches = 0
         grad_accum = getattr(self.cfg, "gradient_accumulation_steps", 1)
@@ -216,15 +236,15 @@ class Trainer:
             self.train_loader,
             desc=f"Epoch {epoch:03d}/{self.cfg.num_epochs:03d} [Train]",
             leave=False,
-            disable=not has_tqdm,
+            disable=not (has_tqdm and self.is_master),
         )
 
         self.optimizer.zero_grad()
 
         for step, batch in enumerate(pbar):
-            images = batch["images"].to(self.device)
-            gt_boxes = [b.to(self.device) for b in batch["boxes"]]
-            gt_masks = [m.to(self.device) for m in batch["masks"]]
+            images = batch["images"].to(self.device, non_blocking=True)
+            gt_boxes = [b.to(self.device, non_blocking=True) for b in batch["boxes"]]
+            gt_masks = [m.to(self.device, non_blocking=True) for m in batch["masks"]]
 
             if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
                 autocast_ctx = torch.amp.autocast(self.device.type, enabled=self.use_amp)
@@ -250,7 +270,7 @@ class Trainer:
 
             # Optimizer step every grad_accum steps or at epoch end
             if (step + 1) % grad_accum == 0 or (step + 1) == len(self.train_loader):
-                raw_model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+                raw_model = self.model.module if hasattr(self.model, "module") else self.model
                 self.scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(raw_model.parameters(), max_norm=1.0)
                 self.scaler.step(self.optimizer)
@@ -263,7 +283,7 @@ class Trainer:
                 total_losses[k] = total_losses.get(k, 0.0) + unscaled_val
             num_batches += 1
 
-            if has_tqdm:
+            if has_tqdm and self.is_master:
                 pbar.set_postfix({"loss": f"{(total_loss.item() * grad_accum):.4f}"})
 
         if num_batches == 0:
