@@ -54,9 +54,13 @@ class FilamentHQ:
             if "model_state_dict" in state_dict:
                 state_dict = state_dict["model_state_dict"]
 
-            # Flexible Warm-Start loading (load matching layers, ignore new task heads)
+            # Flexible Warm-Start loading (load matching layers with automatic dtype alignment)
             model_sd = self.model.state_dict()
-            matched_sd = {k: v for k, v in state_dict.items() if k in model_sd and model_sd[k].shape == v.shape}
+            matched_sd = {
+                k: (v.to(model_sd[k].dtype) if torch.is_floating_point(model_sd[k]) else v)
+                for k, v in state_dict.items()
+                if k in model_sd and model_sd[k].shape == v.shape
+            }
             model_sd.update(matched_sd)
             self.model.load_state_dict(model_sd)
             print(f"  [Warm-Start Success] Loaded {len(matched_sd)}/{len(model_sd)} matching layer tensors into FilamentHQ {version.upper()}!")

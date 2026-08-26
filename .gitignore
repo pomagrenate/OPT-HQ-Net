@@ -8,6 +8,7 @@ MAGFiLO_1.0_Kaggle_2026/
 checkpoints/
 *.pth
 *.pt
+!filament_hq/models/config/best_model_v1.pt
 *.onnx
 *.safetensors
 *.bin
