@@ -94,12 +94,15 @@ class FilamentHQ:
             overfit_single_image=overfit_single_image,
         )
 
+        workers = 0 if overfit_single_image else num_workers
+
         train_loader = DataLoader(
             train_ds,
             batch_size=batch_size,
             shuffle=True,
-            num_workers=0 if overfit_single_image else num_workers,
+            num_workers=workers,
             pin_memory=torch.cuda.is_available(),
+            persistent_workers=(workers > 0),
         )
 
         val_ds = FilamentTileDataset(
@@ -114,7 +117,9 @@ class FilamentHQ:
             val_ds,
             batch_size=batch_size,
             shuffle=False,
-            num_workers=0 if overfit_single_image else num_workers,
+            num_workers=workers,
+            pin_memory=torch.cuda.is_available(),
+            persistent_workers=(workers > 0),
         )
 
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=1e-4)

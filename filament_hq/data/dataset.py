@@ -103,48 +103,60 @@ class FilamentTileDataset(Dataset):
             except Exception as err:
                 print(f"[Dataset WARNING] Failed to parse COCO JSON: {err}")
 
+        # In-memory preprocessed 4-channel cache
+        self._ch4_cache: Dict[str, np.ndarray] = {}
+        self._mask_cache: Dict[str, np.ndarray] = {}
+
         if self.overfit_single_image:
             self.image_files = [self.image_files[0]]
-            print(f"[Dataset] Locked to single overfit image: {self.image_files[0].name}")
+            print(f"[Dataset] Locked to single overfit image: {self.image_files[0].name} (10 tiles/epoch)")
 
     def __len__(self) -> int:
-        return len(self.image_files) * (500 if self.overfit_single_image else 1)
+        return 10 if self.overfit_single_image else len(self.image_files)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         real_idx = 0 if self.overfit_single_image else (idx % len(self.image_files))
         img_path = self.image_files[real_idx]
         img_id = img_path.stem
 
-        # 1. Load image (2048x2048)
-        img = cv2.imread(str(img_path), cv2.IMREAD_UNCHANGED)
-        if img is None:
-            raise ValueError(f"Failed to read image: {img_path}")
-
-        h_img, w_img = img.shape[:2]
-
-        # 2. Load masks (2048x2048) from NPZ or COCO JSON
-        mask_npz = self.mask_dir / f"{img_id}.npz"
-        if mask_npz.exists():
-            data = np.load(mask_npz)
-            masks_arr = data["masks"]  # (N, H, W)
-        elif img_id in self.coco_anns:
-            anns = self.coco_anns[img_id]
-            masks_list = []
-            for ann in anns:
-                seg = ann.get("segmentation")
-                mask = np.zeros((h_img, w_img), dtype=np.uint8)
-                if isinstance(seg, list):
-                    for poly in seg:
-                        pts = np.array(poly, dtype=np.int32).reshape(-1, 2)
-                        cv2.fillPoly(mask, [pts], 1)
-                    masks_list.append(mask)
-            masks_arr = np.stack(masks_list, axis=0) if masks_list else np.zeros((0, h_img, w_img), dtype=np.uint8)
+        # 1. Retrieve 4-channel image & masks (using in-memory cache if available)
+        if img_id in self._ch4_cache:
+            ch4_img = self._ch4_cache[img_id]
+            masks_arr = self._mask_cache[img_id]
+            h, w = ch4_img.shape[:2]
         else:
-            masks_arr = np.zeros((0, h_img, w_img), dtype=np.uint8)
+            img = cv2.imread(str(img_path), cv2.IMREAD_UNCHANGED)
+            if img is None:
+                raise ValueError(f"Failed to read image: {img_path}")
 
-        # 3. Apply 4-channel preprocessor
-        ch4_img = self.preprocessor(img)  # (H, W, 4)
-        h, w = ch4_img.shape[:2]
+            h_img, w_img = img.shape[:2]
+
+            # Load masks from NPZ or COCO JSON
+            mask_npz = self.mask_dir / f"{img_id}.npz"
+            if mask_npz.exists():
+                data = np.load(mask_npz)
+                masks_arr = data["masks"]
+            elif img_id in self.coco_anns:
+                anns = self.coco_anns[img_id]
+                masks_list = []
+                for ann in anns:
+                    seg = ann.get("segmentation")
+                    mask = np.zeros((h_img, w_img), dtype=np.uint8)
+                    if isinstance(seg, list):
+                        for poly in seg:
+                            pts = np.array(poly, dtype=np.int32).reshape(-1, 2)
+                            cv2.fillPoly(mask, [pts], 1)
+                        masks_list.append(mask)
+                masks_arr = np.stack(masks_list, axis=0) if masks_list else np.zeros((0, h_img, w_img), dtype=np.uint8)
+            else:
+                masks_arr = np.zeros((0, h_img, w_img), dtype=np.uint8)
+
+            # Apply 4-channel physical preprocessor & cache
+            ch4_img = self.preprocessor(img)  # (H, W, 4)
+            h, w = ch4_img.shape[:2]
+
+            self._ch4_cache[img_id] = ch4_img
+            self._mask_cache[img_id] = masks_arr
 
         # Combine instance masks into unified semantic mask and instance map
         semantic_mask = (masks_arr.sum(axis=0) > 0).astype(np.uint8) if len(masks_arr) > 0 else np.zeros((h, w), dtype=np.uint8)

@@ -186,9 +186,14 @@ class FilamentTrainer:
 
             self.metric.update(pred_np, gt_np)
 
+            # In overfit mode, stop validation after 2 batches max
+            if self.overfit_single_image and step >= 1:
+                break
+
         metrics = self.metric.compute()
         print(
             f"  [Val Epoch {epoch:03d}] GT Inst: {total_gt_instances} | Pred Inst: {total_pred_instances} | "
+            f"TP: {metrics.get('TP', 0)} | FP: {metrics.get('FP', 0)} | FN: {metrics.get('FN', 0)} | "
             f"Mean Dice: {metrics.get('mean_dice', 0.0):.4f} | PQ: {metrics.get('PQ', 0.0):.4f}"
         )
         return metrics
