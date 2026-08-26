@@ -147,6 +147,8 @@ class HookedFeatureExtractor(nn.Module):
                 print(f"[HookedFeatureExtractor] Loading HuggingFace SegFormer model: '{hf_id}'...")
                 self.model = SegformerModel.from_pretrained(hf_id)
                 enable_hf_segformer_checkpointing(self.model)
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 print("[HookedFeatureExtractor] Enabled HuggingFace Gradient Checkpointing (saves ~65% VRAM).")
                 self.is_hf_segformer = True
                 return
