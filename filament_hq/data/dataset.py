@@ -60,11 +60,13 @@ class FilamentTileDataset(Dataset):
         self.overfit_single_image = overfit_single_image
         self.preprocessor = SolarPhysicalPreprocessor()
 
-        # Locate image directory
+        # Flexible image directory resolution
         if (self.data_root / "images").exists():
             self.image_dir = self.data_root / "images"
         elif (self.data_root / "train_images").exists():
             self.image_dir = self.data_root / "train_images"
+        elif (self.data_root / "test_images").exists():
+            self.image_dir = self.data_root / "test_images"
         else:
             self.image_dir = self.data_root
 
@@ -77,6 +79,29 @@ class FilamentTileDataset(Dataset):
 
         if not self.image_files:
             raise FileNotFoundError(f"No image files found in '{self.image_dir}'.")
+
+        # ── COCO JSON Parsing Support ─────────────────────────────────────
+        self.coco_anns: Dict[str, List[Dict]] = {}
+        json_files = [j for j in (list(self.data_root.glob("*.json")) + list(self.data_root.rglob("*.json"))) if j.name.lower() != "manifest.json"]
+        if json_files:
+            coco_json = json_files[0]
+            try:
+                import json
+                print(f"[Dataset] Parsing COCO annotations from: {coco_json}")
+                with open(coco_json, "r", encoding="utf-8") as f:
+                    coco_data = json.load(f)
+                img_id_map = {
+                    str(img["id"]): (Path(img["file_name"]).stem, img.get("height", 2048), img.get("width", 2048))
+                    for img in coco_data.get("images", [])
+                }
+                for ann in coco_data.get("annotations", []):
+                    c_id = str(ann["image_id"])
+                    if c_id in img_id_map:
+                        stem, h, w = img_id_map[c_id]
+                        self.coco_anns.setdefault(stem, []).append({**ann, "_h": h, "_w": w})
+                print(f"[Dataset] Successfully loaded annotations for {len(self.coco_anns)} image stems.")
+            except Exception as err:
+                print(f"[Dataset WARNING] Failed to parse COCO JSON: {err}")
 
         if self.overfit_single_image:
             self.image_files = [self.image_files[0]]
@@ -95,13 +120,27 @@ class FilamentTileDataset(Dataset):
         if img is None:
             raise ValueError(f"Failed to read image: {img_path}")
 
-        # 2. Load masks (2048x2048)
+        h_img, w_img = img.shape[:2]
+
+        # 2. Load masks (2048x2048) from NPZ or COCO JSON
         mask_npz = self.mask_dir / f"{img_id}.npz"
         if mask_npz.exists():
             data = np.load(mask_npz)
             masks_arr = data["masks"]  # (N, H, W)
+        elif img_id in self.coco_anns:
+            anns = self.coco_anns[img_id]
+            masks_list = []
+            for ann in anns:
+                seg = ann.get("segmentation")
+                mask = np.zeros((h_img, w_img), dtype=np.uint8)
+                if isinstance(seg, list):
+                    for poly in seg:
+                        pts = np.array(poly, dtype=np.int32).reshape(-1, 2)
+                        cv2.fillPoly(mask, [pts], 1)
+                    masks_list.append(mask)
+            masks_arr = np.stack(masks_list, axis=0) if masks_list else np.zeros((0, h_img, w_img), dtype=np.uint8)
         else:
-            masks_arr = np.zeros((0, img.shape[0], img.shape[1]), dtype=np.uint8)
+            masks_arr = np.zeros((0, h_img, w_img), dtype=np.uint8)
 
         # 3. Apply 4-channel preprocessor
         ch4_img = self.preprocessor(img)  # (H, W, 4)
