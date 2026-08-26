@@ -28,7 +28,7 @@ from filament_hq.data.dataset import FilamentTileDataset
 from filament_hq.data.tiler import TileStitcher, ImageTiler
 from filament_hq.losses.losses import FilamentCompoundLoss, check_finite
 from filament_hq.models.model import FilamentHQModel
-from opt_hq_net.metrics.panoptic_quality import PanopticQualityMetric
+from filament_hq.metrics.panoptic_quality import PanopticQualityMetric
 
 
 class FilamentTrainer:
