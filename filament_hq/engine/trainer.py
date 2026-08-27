@@ -120,7 +120,7 @@ class FilamentTrainer:
 
     def _train_one_epoch(self, epoch: int) -> Dict[str, float]:
         self.model.train()
-        running_losses = {"total_loss": 0.0, "loss_semantic": 0.0, "loss_boundary": 0.0, "loss_skeleton": 0.0, "loss_instance": 0.0}
+        running_losses: Dict[str, float] = {}
 
         pbar = tqdm(self.train_loader, desc=f"Epoch {epoch:03d} [Train]", leave=False)
         t_data_start = time.time()
@@ -168,11 +168,13 @@ class FilamentTrainer:
             if epoch == 1 and step == 0:
                 print(f"\n[PROFILE Step 1] Data Load: {t_data*1000:.1f}ms | Forward: {t_fwd*1000:.1f}ms | Backward: {t_bwd*1000:.1f}ms")
 
-            for k in running_losses:
-                if k in loss_dict:
-                    running_losses[k] += loss_dict[k].item()
+            for k, v in loss_dict.items():
+                val_float = v.item() if isinstance(v, torch.Tensor) else float(v)
+                running_losses[k] = running_losses.get(k, 0.0) + val_float
 
-            pbar.set_postfix(total_loss=f"{loss_dict['total_loss'].item():.4f}")
+            tot_val = loss_dict["total_loss"]
+            tot_float = tot_val.item() if isinstance(tot_val, torch.Tensor) else float(tot_val)
+            pbar.set_postfix(total_loss=f"{tot_float:.4f}")
             t_data_start = time.time()
 
         num_steps = max(len(self.train_loader), 1)

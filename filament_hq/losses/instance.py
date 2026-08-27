@@ -51,7 +51,7 @@ class DiscriminativeEmbeddingLoss(nn.Module):
             Combined variance + distance loss.
         """
         b, c, h, w = embeddings.shape
-        total_loss = 0.0
+        total_loss = embeddings.new_zeros(())
         valid_batches = 0
 
         for i in range(b):
@@ -70,7 +70,7 @@ class DiscriminativeEmbeddingLoss(nn.Module):
             emb_i = embeddings[i]  # (C, H, W)
 
             centers = []
-            var_loss = 0.0
+            var_loss = embeddings.new_zeros(())
 
             # 1. Variance Loss: pull pixels to cluster center
             for mask in non_empty:
@@ -80,22 +80,22 @@ class DiscriminativeEmbeddingLoss(nn.Module):
                 centers.append(center.squeeze(1))
 
                 dist = torch.norm(pts_emb - center, p=self.norm, dim=0) - self.delta_var
-                var_loss += F.relu(dist).pow(2).mean()
+                var_loss = var_loss + F.relu(dist).pow(2).mean()
 
             var_loss = var_loss / num_inst
 
             # 2. Distance Loss: push cluster centers apart
-            dist_loss = 0.0
+            dist_loss = embeddings.new_zeros(())
             if num_inst > 1:
                 centers_tensor = torch.stack(centers, dim=0)  # (N, C)
                 for j in range(num_inst):
                     for k in range(j + 1, num_inst):
                         c_dist = torch.norm(centers_tensor[j] - centers_tensor[k], p=self.norm)
                         dist_penalty = 2.0 * self.delta_dist - c_dist
-                        dist_loss += F.relu(dist_penalty).pow(2)
+                        dist_loss = dist_loss + F.relu(dist_penalty).pow(2)
                 dist_loss = dist_loss / (num_inst * (num_inst - 1) / 2.0)
 
-            total_loss += (var_loss + dist_loss)
+            total_loss = total_loss + (var_loss + dist_loss)
 
         return total_loss / max(valid_batches, 1)
 
