@@ -1,6 +1,10 @@
-# Datasets
+# Datasets & Caches
 MAGFiLO_1.0_Kaggle_2026/
+filament-segmentation-2026/
 /data/
+magfilo_hq_cache/
+*.npy
+*.npz
 *.fits
 *.h5
 
@@ -8,7 +12,6 @@ MAGFiLO_1.0_Kaggle_2026/
 checkpoints/
 *.pth
 *.pt
-!filament_hq/models/config/best_model_v1.pt
 *.onnx
 *.safetensors
 *.bin

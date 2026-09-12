@@ -1,55 +1,39 @@
 """
-Ultralytics-Style Offline Dataset Cache Builder for Filament-HQ.
+Simple Offline Dataset Cache Builder for Solar Filament Segmentation.
 
-Pre-computes:
-  1. 4-channel physical representation (C0: raw, C1: contrast, C2: blackhat, C3: radial) -> FP16 .npy
-  2. COCO polygon rasterized instance masks -> compressed uint8 .npz
-  3. Pre-computed 1024x1024 tile coordinates and foreground density statistics -> index.pkl
+Converts raw H-alpha images and COCO polygon annotations into lightweight
+NumPy (.npy) arrays for ultra-fast disk I/O and zero-CPU rasterization training.
+
+Usage:
+    python tools/build_cache.py \
+        --data_root /path/to/MAGFiLO_1.0_Kaggle_2026/train \
+        --output /path/to/magfilo_hq_cache
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
-import pickle
+import shutil
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Tuple
-
-# Add repository root directory to sys.path
-ROOT = Path(__file__).resolve().parent.parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+from typing import Dict, List
 
 import cv2
 import numpy as np
-from tqdm import tqdm
-
-from filament_hq.data.preprocessor import SolarPhysicalPreprocessor
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Ultralytics-Style Cache Builder for Filament-HQ")
+    parser = argparse.ArgumentParser(description="Convert Solar Filament Dataset to .npy Cache")
     parser.add_argument("--data_root", type=str, required=True, help="Path to raw dataset directory")
     parser.add_argument("--output", type=str, default="magfilo_hq_cache", help="Output cache directory")
-    parser.add_argument("--tile_size", type=int, default=1024, help="Tile size (default 1024)")
-    parser.add_argument("--stride", type=int, default=768, help="Tile stride for indexing (default 768)")
-    parser.add_argument(
-        "--dtype",
-        type=str,
-        default="uint8",
-        choices=["uint8", "float16", "float32"],
-        help="Precision for cached 4-channel images (uint8 uses ~5.6GB, float16 uses ~23.7GB)",
-    )
-    parser.add_argument(
-        "--cache_mode",
-        type=str,
-        default="full",
-        choices=["full", "morph_only"],
-        help="full: cache all 4 channels | morph_only: cache heavy C1 & C2 channels (~2.8GB)",
-    )
+    parser.add_argument("--max_samples", type=int, default=None, help="Optional max images to cache (for testing)")
+    
+    # Compatibility arguments (ignored to prevent CLI breakage if passed by user)
+    parser.add_argument("--dtype", type=str, default="uint8", help="Data type (default uint8, kept for compatibility)")
+    parser.add_argument("--cache_mode", type=str, default="full", help="Cache mode (kept for compatibility)")
+    
     return parser.parse_args()
 
 
@@ -58,125 +42,137 @@ def build_cache():
     data_root = Path(args.data_root)
     output_dir = Path(args.output)
 
+    if not data_root.exists():
+        print(f"[ERROR] data_root '{data_root}' does not exist!")
+        sys.exit(1)
+
     img_out_dir = output_dir / "images"
     mask_out_dir = output_dir / "masks"
     img_out_dir.mkdir(parents=True, exist_ok=True)
     mask_out_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. Locate images
-    if (data_root / "images").exists():
-        img_dir = data_root / "images"
-    elif (data_root / "train_images").exists():
-        img_dir = data_root / "train_images"
-    else:
+    # 1. Locate raw images directory
+    img_dir = None
+    for cand in ["train_images", "images", "train"]:
+        if (data_root / cand).is_dir():
+            img_dir = data_root / cand
+            break
+    if img_dir is None:
         img_dir = data_root
 
-    exts = [".png", ".jpg", ".jpeg", ".fits"]
+    exts = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".fits"}
     img_files = sorted([p for p in img_dir.iterdir() if p.is_file() and p.suffix.lower() in exts])
-    print(f"[CacheBuilder] Found {len(img_files)} images in '{img_dir}'.")
-    print(f" Cache Mode: {args.cache_mode} | Precision: {args.dtype}")
+    if not img_files:
+        img_files = sorted([p for p in img_dir.rglob("*") if p.is_file() and p.suffix.lower() in exts])
 
-    # 2. Parse COCO JSON
-    coco_anns: Dict[str, List[Dict]] = {}
-    json_files = [j for j in (list(data_root.glob("*.json")) + list(data_root.rglob("*.json"))) if j.name.lower() != "manifest.json"]
+    print(f"[CacheBuilder] Found {len(img_files)} raw images in '{img_dir}'.")
+    if args.max_samples is not None:
+        img_files = img_files[: args.max_samples]
+        print(f"[CacheBuilder] Capping to {len(img_files)} samples (--max_samples).")
+
+    # 2. Parse COCO JSON annotations if available
+    coco_anns: Dict[str, List[np.ndarray]] = {}
+    json_files = [j for j in data_root.rglob("*.json") if "manifest" not in j.name.lower()]
+    source_json = None
+
     if json_files:
-        coco_json = json_files[0]
-        print(f"[CacheBuilder] Parsing COCO annotations from: {coco_json}")
-        with open(coco_json, "r", encoding="utf-8") as f:
-            coco_data = json.load(f)
-        img_id_map = {
-            str(img["id"]): (Path(img["file_name"]).stem, img.get("height", 2048), img.get("width", 2048))
-            for img in coco_data.get("images", [])
-        }
-        for ann in coco_data.get("annotations", []):
-            c_id = str(ann["image_id"])
-            if c_id in img_id_map:
-                stem, h, w = img_id_map[c_id]
-                coco_anns.setdefault(stem, []).append({**ann, "_h": h, "_w": w})
+        source_json = json_files[0]
+        print(f"[CacheBuilder] Parsing COCO annotations from: {source_json.name}")
+        try:
+            with open(source_json, "r", encoding="utf-8") as f:
+                coco_data = json.load(f)
 
-    preprocessor = SolarPhysicalPreprocessor()
-    index_metadata = {}
+            img_id_to_stem = {}
+            for img_info in coco_data.get("images", []):
+                fname = img_info.get("file_name", "")
+                stem = Path(fname).stem
+                img_id_to_stem[img_info["id"]] = stem
+
+            for ann in coco_data.get("annotations", []):
+                i_id = ann.get("image_id")
+                if i_id in img_id_to_stem:
+                    stem = img_id_to_stem[i_id]
+                    seg = ann.get("segmentation", [])
+                    if isinstance(seg, list):
+                        for poly in seg:
+                            if len(poly) >= 6:
+                                pts = np.array(poly, dtype=np.int32).reshape(-1, 2)
+                                coco_anns.setdefault(stem, []).append(pts)
+
+            print(f"[CacheBuilder] Indexed annotations for {len(coco_anns)} images.")
+        except Exception as e:
+            print(f"[CacheBuilder] Warning: Failed to parse COCO annotations: {e}")
+
+    # 3. Process & save .npy files
     start_time = time.time()
+    num_cached = 0
+    total_imgs = len(img_files)
 
-    print(f"[CacheBuilder] Building dataset cache to '{output_dir}'...")
+    print(f"[CacheBuilder] Converting images and rasterizing masks to .npy in '{output_dir}'...")
 
-    for img_path in tqdm(img_files, desc="Caching Dataset"):
+    for i, img_path in enumerate(img_files):
         stem = img_path.stem
         raw_img = cv2.imread(str(img_path), cv2.IMREAD_UNCHANGED)
         if raw_img is None:
+            raw_img = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
+        if raw_img is None:
+            print(f"[WARN] Unable to load '{img_path}', skipping.")
             continue
 
-        h_img, w_img = raw_img.shape[:2]
+        h, w = raw_img.shape[:2]
 
-        # 1. 4-Channel Preprocessing
-        ch4_img = preprocessor(raw_img)  # (H, W, 4) float32 [0, 1]
-
-        if args.cache_mode == "morph_only":
-            ch4_img = ch4_img[:, :, 1:3]  # Keep only C1 (contrast) & C2 (blackhat)
-
-        if args.dtype == "uint8":
-            ch4_img = (np.clip(ch4_img, 0.0, 1.0) * 255.0).astype(np.uint8)
-        elif args.dtype == "float16":
-            ch4_img = ch4_img.astype(np.float16)
+        # Optimize storage: If all 3 channels are identical (MAGFiLO H-alpha standard),
+        # store as 2D uint8 (2048, 2048) to reduce Kaggle disk usage from ~14GB to ~4.7GB
+        if raw_img.ndim == 3 and raw_img.shape[2] == 3:
+            if np.array_equal(raw_img[:, :, 0], raw_img[:, :, 1]) and np.array_equal(raw_img[:, :, 0], raw_img[:, :, 2]):
+                save_img = raw_img[:, :, 0].astype(np.uint8)
+            else:
+                save_img = cv2.cvtColor(raw_img, cv2.COLOR_BGR2RGB).astype(np.uint8)
         else:
-            ch4_img = ch4_img.astype(np.float32)
+            save_img = raw_img.astype(np.uint8)
 
-        np.save(img_out_dir / f"{stem}.npy", ch4_img)
+        # Save image as .npy
+        np.save(img_out_dir / f"{stem}.npy", save_img)
 
-        # 2. Instance Mask Rasterization
-        anns = coco_anns.get(stem, [])
-        masks_list = []
-        for ann in anns:
-            seg = ann.get("segmentation")
-            mask = np.zeros((h_img, w_img), dtype=np.uint8)
-            if isinstance(seg, list):
-                for poly in seg:
-                    pts = np.array(poly, dtype=np.int32).reshape(-1, 2)
-                    cv2.fillPoly(mask, [pts], 1)
-                masks_list.append(mask)
+        # Generate & save mask as .npy
+        mask = np.zeros((h, w), dtype=np.uint8)
+        if stem in coco_anns:
+            for pts in coco_anns[stem]:
+                cv2.fillPoly(mask, [pts], 1)
+        else:
+            # Check for existing mask file fallback
+            mask_fallback = data_root / "masks" / f"{stem}.png"
+            if mask_fallback.exists():
+                loaded_m = cv2.imread(str(mask_fallback), cv2.IMREAD_GRAYSCALE)
+                if loaded_m is not None:
+                    mask = (loaded_m > 127).astype(np.uint8)
 
-        masks_arr = np.stack(masks_list, axis=0) if masks_list else np.zeros((0, h_img, w_img), dtype=np.uint8)
-        np.savez_compressed(mask_out_dir / f"{stem}.npz", masks=masks_arr)
+        np.save(mask_out_dir / f"{stem}.npy", mask)
+        num_cached += 1
 
-        # 3. Precompute Tile Index & Foreground Density Statistics
-        sem_mask = (masks_arr.sum(axis=0) > 0).astype(np.uint8) if len(masks_arr) > 0 else np.zeros((h_img, w_img), dtype=np.uint8)
-        tiles_meta = []
-        
-        for y1 in range(0, h_img - args.tile_size + 1, args.stride):
-            for x1 in range(0, w_img - args.tile_size + 1, args.stride):
-                tile_sem = sem_mask[y1:y1 + args.tile_size, x1:x1 + args.tile_size]
-                fg_ratio = float(tile_sem.mean())
-                tiles_meta.append({
-                    "y1": y1,
-                    "x1": x1,
-                    "fg_ratio": fg_ratio,
-                    "is_positive": fg_ratio > 0.005,
-                })
+        if (i + 1) % 100 == 0 or (i + 1) == total_imgs:
+            elapsed = time.time() - start_time
+            rate = (i + 1) / max(0.01, elapsed)
+            print(f"  [{i + 1:04d}/{total_imgs:04d}] Cached -> {stem}.npy ({rate:.1f} imgs/s)")
 
-        index_metadata[stem] = {
-            "stem": stem,
-            "h": h_img,
-            "w": w_img,
-            "num_instances": len(masks_arr),
-            "npy_path": str(img_out_dir / f"{stem}.npy"),
-            "npz_path": str(mask_out_dir / f"{stem}.npz"),
-            "tiles": tiles_meta,
-        }
+    # 4. Copy/link COCO JSON annotations if available
+    if source_json and source_json.exists():
+        dest_json = output_dir / source_json.name
+        try:
+            shutil.copy2(source_json, dest_json)
+            # Also provide standard annotations.json name
+            shutil.copy2(source_json, output_dir / "annotations.json")
+            print(f"[CacheBuilder] Copied annotations to: {output_dir / 'annotations.json'}")
+        except Exception as e:
+            print(f"[CacheBuilder] Note: Could not copy JSON annotations: {e}")
 
-    # Save index.pkl
-    index_path = output_dir / "index.pkl"
-    with open(index_path, "wb") as f:
-        pickle.dump({
-            "version": "1.0.0",
-            "tile_size": args.tile_size,
-            "stride": args.stride,
-            "dtype": args.dtype,
-            "items": index_metadata,
-        }, f)
-
-    elapsed = time.time() - start_time
-    print(f"\n[CacheBuilder] 🎉 Preprocessing complete! Cached {len(index_metadata)} images in {elapsed:.1f}s.")
-    print(f" Saved index metadata to: {index_path}\n")
+    total_time = time.time() - start_time
+    print("\n========================================================")
+    print(f"[CacheBuilder] Caching Complete! Successfully converted {num_cached} images to .npy")
+    print(f"  Images directory: {img_out_dir}")
+    print(f"  Masks directory : {mask_out_dir}")
+    print(f"  Total time      : {total_time:.2f}s ({num_cached / max(0.01, total_time):.1f} imgs/s)")
+    print("========================================================\n")
 
 
 if __name__ == "__main__":

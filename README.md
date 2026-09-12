@@ -147,44 +147,131 @@ Participants must submit a single **CSV file** containing run-length encoded (RL
 
 ---
 
-## 🚀 Quickstart: Code Example
+## 🚀 Ultra-Efficient PyTorch Framework
 
-You can easily encode binary segmentation masks into the required RLE string format using `pycocotools`:
+The framework is refactored into a clean, flat, modular design under `src/` engineered specifically for **Kaggle Notebooks (2x NVIDIA T4 / 2x P100, 16GB VRAM, 4 vCPUs)**:
+
+### 📁 Project Structure
+
+```text
+solar_filament_seg/
+├── src/
+│   ├── __init__.py           # Clean public API exports
+│   ├── model.py              # SolarFilamentNet: timm backbone + multi-scale pyramid decoder (dual heads: mask + skeleton)
+│   ├── losses.py             # GPU-differentiable Soft-clDice + BCE + Dice + Skeleton compound loss
+│   ├── dataset.py            # SolarFilamentFastDataset: zero-CPU morphology, on-the-fly polygon rasterization
+│   ├── trainer.py            # SolarTrainer: DDP (2x GPU), AMP FP16, ModelEMA, emergency interrupt handling
+│   ├── inference.py          # FastPatchInferer: batched 2048x2048 sliding-window with 2D Gaussian tapering
+│   └── utils.py              # Column-major RLE encoder/decoder, Panoptic Quality (PQ) metric, EMA
+├── train.py                  # CLI training entrypoint (supports DDP & checkpoint resumption)
+├── predict.py                # CLI inference entrypoint (generates valid Kaggle submission.csv)
+├── test_pipeline.py          # Comprehensive 6-stage end-to-end verification test suite
+└── requirements.txt          # Minimal production dependencies
+```
+
+---
+
+### ⚡ Target Hardware & Performance Constraints
+
+- **Hardware**: Kaggle Notebook (2x NVIDIA T4 or 2x P100, 16GB VRAM each, 4 vCPUs).
+- **VRAM Budget**: Strictly **< 10GB per GPU** during training (typically ~3.2GB with ResNet34, batch size 4, 512x512 tiles in AMP).
+- **Throughput Optimization**: Zero CPU morphology. Soft-clDice morphological min/max pooling is computed purely on GPU using `torch.nn.functional.max_pool2d`.
+- **Sliding-Window Stitching**: High-speed batched tile inference with smooth 2D Gaussian overlap blending.
+
+---
+
+### 🛠️ Usage Guide
+
+#### 1. (Optional) Offline Preprocessing: Build `.npy` Cache
+
+Accelerate DataLoader training throughput and eliminate JPEG decoding overhead by converting raw H-alpha images and annotations into lightweight `.npy` arrays:
+
+```bash
+python tools/build_cache.py \
+    --data_root /kaggle/input/competitions/filament-segmentation-2026/MAGFiLO_1.0_Kaggle_2026/train \
+    --output /kaggle/working/magfilo_hq_cache
+```
+
+This creates:
+- `/kaggle/working/magfilo_hq_cache/images/*.npy`
+- `/kaggle/working/magfilo_hq_cache/masks/*.npy`
+- `/kaggle/working/magfilo_hq_cache/annotations.json`
+
+You can then pass `--data_root /kaggle/working/magfilo_hq_cache` directly to `train.py`.
+
+#### 2. Kaggle 2x GPU Distributed Training (DDP)
+
+Launch multi-GPU training across both GPUs using PyTorch's native `torchrun`:
+
+```bash
+torchrun --nproc_per_node=2 train.py \
+    --data_root /kaggle/working/magfilo_hq_cache \
+    --backbone resnet34 \
+    --tile_size 512 \
+    --stride 384 \
+    --batch_size 4 \
+    --epochs 50 \
+    --use_amp
+```
+
+For single-GPU training:
+```bash
+python train.py --data_root ./data/train --batch_size 4 --epochs 50 --use_amp
+```
+
+#### 2. Checkpoint Resumption (Seamless Continuation)
+
+If training is interrupted, times out, or disconnected, resume seamlessly without losing optimizer states, scheduler steps, or EMA weights:
+
+```bash
+# Resume from the most recent epoch checkpoint
+python train.py --data_root ./data/train --resume last
+
+# Or specify a particular milestone or emergency interrupt checkpoint:
+python train.py --data_root ./data/train --resume checkpoints/checkpoint_interrupted.pt
+```
+
+Saved checkpoints in `checkpoints/`:
+- `best_model.pt`: Saved whenever validation Dice improves.
+- `last.pt`: Saved at every epoch.
+- `checkpoint_epoch_XXX.pt`: Milestone checkpoints saved every `--save_interval` epochs.
+- `checkpoint_interrupted.pt`: Emergency checkpoint generated on `SIGINT` (`Ctrl+C` or timeout).
+
+#### 3. High-Speed Batched Inference & Submission
+
+Generate the competition `submission.csv` on 2048x2048 test images:
+
+```bash
+python predict.py \
+    --weights checkpoints/best_model.pt \
+    --data_root /kaggle/input/filament-segmentation-2026/MAGFiLO_1.0_Kaggle_2026/test \
+    --output submission.csv \
+    --threshold 0.50 \
+    --min_area 30
+```
+
+#### 4. Run End-to-End Verification Test Suite
+
+Verify all 6 pipeline components (Model, Loss backprop, Patch Inferer, Checkpoint Resumption, RLE bitwise roundtrip, and Dataset indexing):
+
+```bash
+python test_pipeline.py
+```
+
+---
+
+### 📦 Kaggle RLE Mask Helper Code
 
 ```python
 import numpy as np
-from pycocotools import mask as mask_utils
+from src.utils import binary_mask_to_rle, rle_to_binary_mask
 
-def binary_mask_to_rle_string(binary_mask: np.ndarray) -> str:
-    """
-    Converts a binary numpy array mask (2048x2048) into an RLE count string.
-    
-    Args:
-        binary_mask (np.ndarray): 2D uint8 binary mask where 1 = filament, 0 = background.
-        
-    Returns:
-        str: UTF-8 decoded RLE count string for CSV submission.
-    """
-    # Ensure Fortran array ordering as required by pycocotools
-    fortran_mask = np.asfortranarray(binary_mask.astype(np.uint8))
-    
-    # Encode mask to RLE dictionary
-    rle_dict = mask_utils.encode(fortran_mask)
-    
-    # Extract RLE counts string
-    rle_string = rle_dict['counts'].decode('utf-8')
-    return rle_string
+# Encode binary mask (2048x2048) to column-major Kaggle RLE string
+rle_str = binary_mask_to_rle(mask)
 
-def rle_string_to_binary_mask(rle_string: str, height: int = 2048, width: int = 2048) -> np.ndarray:
-    """
-    Decodes an RLE count string back into a 2D binary numpy mask.
-    """
-    rle_dict = {
-        'size': [height, width],
-        'counts': rle_string.encode('utf-8')
-    }
-    binary_mask = mask_utils.decode(rle_dict)
-    return binary_mask
+# Decode back to full binary mask (2048x2048)
+recovered_mask = rle_to_binary_mask(rle_str, height=2048, width=2048)
+assert np.array_equal(mask, recovered_mask)
 ```
 
 ---
