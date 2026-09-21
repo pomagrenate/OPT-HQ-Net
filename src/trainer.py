@@ -37,6 +37,9 @@ from src.losses import CompoundLoss
 from src.utils import ModelEMA, PanopticQualityMetric
 
 
+_MAX_DEFAULT_VAL_BATCHES = 500  # Safety cap: prevents >10min val loops causing NCCL watchdog timeouts
+
+
 class SolarTrainer:
     """
     Unified High-Performance Trainer Engine.
@@ -67,6 +70,9 @@ class SolarTrainer:
         Process rank for DDP (default: 0).
     world_size : int
         Total process count for DDP (default: 1).
+    max_val_batches : int
+        Maximum number of validation batches per epoch to prevent NCCL watchdog timeouts.
+        Default 500 (~500 * batch_size=4 = 2000 tiles, fast enough to not stall DDP ranks).
     """
 
     def __init__(
@@ -83,6 +89,7 @@ class SolarTrainer:
         save_interval: int = 1,
         rank: int = 0,
         world_size: int = 1,
+        max_val_batches: int = _MAX_DEFAULT_VAL_BATCHES,
     ) -> None:
         self.rank = rank
         self.world_size = world_size
@@ -97,6 +104,7 @@ class SolarTrainer:
 
         self.epochs = epochs
         self.save_interval = max(1, save_interval)
+        self.max_val_batches = max(10, max_val_batches)  # Safety floor: always run ≥10 val batches
         self.checkpoint_dir = Path(checkpoint_dir)
         if self.is_master:
             self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -305,14 +313,27 @@ class SolarTrainer:
                         f"Skel: {train_metrics['loss_skel']:.4f}"
                     )
 
-                # Validation
+                # Validation — must be wrapped in DDP barriers to prevent NCCL watchdog timeout.
+                # Root cause of prior crash: Rank 0 runs long val loop while Rank 1 sits idle.
+                # The NCCL watchdog on Rank 1 fires after 600s, triggering SIGABRT on both ranks.
+                # Fix: ALL ranks enter a barrier BEFORE val starts, then again AFTER val completes.
                 is_best = False
-                if self.val_loader is not None and self.is_master and (epoch % 2 == 0 or epoch == self.epochs):
+                do_validate = (self.val_loader is not None and (epoch % 2 == 0 or epoch == self.epochs))
+
+                # All ranks synchronize before validation gate
+                if self.world_size > 1 and dist.is_available() and dist.is_initialized():
+                    dist.barrier()
+
+                if do_validate and self.is_master:
                     val_metrics = self._validate(epoch)
                     curr_dice = val_metrics.get("mean_dice", 0.0)
                     if curr_dice > self.best_dice:
                         self.best_dice = curr_dice
                         is_best = True
+
+                # All ranks synchronize again after validation completes
+                if self.world_size > 1 and dist.is_available() and dist.is_initialized():
+                    dist.barrier()
 
                 self._save_checkpoint(epoch, is_best=is_best)
 
@@ -382,9 +403,14 @@ class SolarTrainer:
         eval_model.eval()
         self.metric.reset()
 
-        pbar = tqdm(self.val_loader, desc=f"Epoch {epoch:03d} [Val  ]", leave=False)
+        total_val = len(self.val_loader)
+        capped = min(total_val, self.max_val_batches)
+        pbar = tqdm(self.val_loader, desc=f"Epoch {epoch:03d} [Val  ]", total=capped, leave=False)
 
-        for batch in pbar:
+        for step, batch in enumerate(pbar):
+            if step >= self.max_val_batches:
+                break
+
             images = batch["image"].to(self.device, non_blocking=True)
             masks = batch["mask"].cpu().numpy()
 
@@ -409,5 +435,6 @@ class SolarTrainer:
         print(
             f"  [Val Epoch {epoch:03d}] Mean Dice: {metrics['mean_dice']:.4f} | "
             f"PQ: {metrics['PQ']:.4f} | TP: {metrics['TP']} | FP: {metrics['FP']} | FN: {metrics['FN']}"
+            f" | Batches: {min(capped, total_val)}/{total_val}"
         )
         return metrics

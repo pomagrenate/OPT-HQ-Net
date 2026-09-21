@@ -54,6 +54,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint .pt to resume from, or 'last'")
     parser.add_argument("--save_interval", type=int, default=1, help="Interval in epochs to save milestone checkpoints")
     parser.add_argument("--num_workers", type=int, default=2, help="DataLoader worker processes per GPU (default: 2)")
+    parser.add_argument("--max_val_batches", type=int, default=500, help="Max validation batches per epoch to avoid NCCL timeout (default: 500)")
     return parser.parse_args()
 
 
@@ -154,6 +155,7 @@ def main() -> None:
         save_interval=args.save_interval,
         rank=rank,
         world_size=world_size,
+        max_val_batches=args.max_val_batches,
     )
 
     trainer.train()
