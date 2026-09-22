@@ -309,7 +309,7 @@ def main():
         schedulers=[
             optim.lr_scheduler.LinearLR(
                 optimizer,
-                start_factor=0.0,
+                start_factor=0.01,  # Must be > 0
                 end_factor=1.0,
                 total_iters=args.warmup_epochs,
             ),
