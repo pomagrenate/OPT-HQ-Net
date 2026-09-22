@@ -31,9 +31,9 @@ Using the main interface:
 python main.py train --data_root /path/to/MAGFiLO_1.0_Kaggle_2026
 ```
 
-For Kaggle (memory-optimized):
+For Kaggle (GPU-optimized):
 ```bash
-python main.py train --data_root /path/to/MAGFiLO_1.0_Kaggle_2026 --batch_size 2 --tile_size 128
+python main.py train --data_root /path/to/MAGFiLO_1.0_Kaggle_2026 --batch_size 4 --tile_size 256
 ```
 
 Or using the standalone training script:
@@ -114,10 +114,10 @@ python main.py predict \
 ### Training Parameters
 
 - `--data_root`: Path to training data directory (required)
-- `--batch_size`: Batch size for training (default: 2, use 2 for Kaggle)
+- `--batch_size`: Batch size for training (default: 4, increase for better GPU utilization)
 - `--epochs`: Number of training epochs (default: 50)
 - `--lr`: Learning rate (default: 1e-4)
-- `--tile_size`: Size of training patches (default: 128, use 128 for Kaggle)
+- `--tile_size`: Size of training patches (default: 256, larger = better GPU utilization)
 - `--overlap`: Overlap fraction for tiling (default: 0.25)
 - `--use_amp`: Enable automatic mixed precision training
 - `--use_ema`: Enable exponential moving average of model weights
@@ -149,12 +149,12 @@ Training creates the following checkpoints in the `checkpoints/` directory:
 ### Complete Training and Inference Workflow
 
 ```bash
-# 1. Train the model (Kaggle-optimized)
+# 1. Train the model (GPU-optimized for maximum performance)
 python main.py train \
     --data_root /path/to/MAGFiLO_1.0_Kaggle_2026 \
     --epochs 50 \
-    --batch_size 2 \
-    --tile_size 128 \
+    --batch_size 4 \
+    --tile_size 256 \
     --use_amp \
     --use_ema
 

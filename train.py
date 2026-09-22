@@ -34,14 +34,14 @@ def parse_args():
                        help='Use cached .npy files if available')
     
     # Model arguments
-    parser.add_argument('--tile_size', type=int, default=64,
-                       help='Tile size for training patches (smaller = faster)')
+    parser.add_argument('--tile_size', type=int, default=256,
+                       help='Tile size for training patches (larger = better GPU utilization)')
     parser.add_argument('--overlap', type=float, default=0.25,
                        help='Overlap fraction for tiling')
     
     # Training arguments
-    parser.add_argument('--batch_size', type=int, default=1,
-                       help='Batch size for training (smaller = faster)')
+    parser.add_argument('--batch_size', type=int, default=4,
+                       help='Batch size for training (increase for better GPU utilization)')
     parser.add_argument('--epochs', type=int, default=50,
                        help='Number of training epochs')
     parser.add_argument('--lr', type=float, default=1e-4,
