@@ -28,6 +28,8 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -331,6 +333,13 @@ class SolarTrainer:
                         self.best_dice = curr_dice
                         is_best = True
 
+                    # Visualize predictions
+                    self._visualize_predictions(
+                        self.ema.module if self.ema is not None else self.raw_model,
+                        epoch,
+                        num_samples=4,
+                    )
+
                 # All ranks synchronize again after validation completes
                 if self.world_size > 1 and dist.is_available() and dist.is_initialized():
                     dist.barrier()
@@ -398,6 +407,111 @@ class SolarTrainer:
 
         num_batches = max(len(self.train_loader), 1)
         return {k: v / num_batches for k, v in running_losses.items()}
+
+    def _visualize_predictions(
+        self,
+        eval_model: nn.Module,
+        epoch: int,
+        num_samples: int = 4,
+    ) -> None:
+        """
+        Visualize validation predictions with side-by-side comparison.
+
+        Creates a figure with 5 columns:
+        - Column 1: Input Solar Image (Grayscale)
+        - Column 2: Ground Truth Mask
+        - Column 3: Predicted Mask
+        - Column 4: Ground Truth Skeleton
+        - Column 5: Predicted Skeleton
+        """
+        eval_model.eval()
+        vis_dir = self.checkpoint_dir / "visualizations"
+        vis_dir.mkdir(parents=True, exist_ok=True)
+
+        # Get a batch of samples
+        batch = next(iter(self.val_loader))
+        images = batch["image"].to(self.device, non_blocking=True)
+        masks = batch["mask"].to(self.device, non_blocking=True)
+        skeletons = batch["skeleton"].to(self.device, non_blocking=True)
+
+        # Select random samples
+        indices = torch.randperm(images.size(0))[:num_samples]
+        sample_images = images[indices]
+        sample_masks = masks[indices]
+        sample_skeletons = skeletons[indices]
+
+        # Inference
+        with torch.no_grad():
+            logits = eval_model(sample_images)
+
+        # Convert to probabilities and binary predictions
+        mask_probs = torch.sigmoid(logits[:, 0:1])
+        skeleton_probs = torch.sigmoid(logits[:, 1:2])
+        mask_preds = (mask_probs > 0.5).float()
+        skeleton_preds = (skeleton_probs > 0.5).float()
+
+        # Compute Dice scores for each sample
+        dice_scores = []
+        for i in range(num_samples):
+            # Dice for mask
+            intersection = (mask_preds[i, 0] * sample_masks[i, 0]).sum()
+            union = mask_preds[i, 0].sum() + sample_masks[i, 0].sum()
+            dice = 2 * intersection / (union + 1e-8)
+            dice_scores.append(dice.item())
+
+        # Convert to numpy for plotting
+        sample_images_np = sample_images.cpu().numpy()
+        sample_masks_np = sample_masks.cpu().numpy()
+        sample_skeletons_np = sample_skeletons.cpu().numpy()
+        mask_probs_np = mask_probs.cpu().numpy()
+        skeleton_probs_np = skeleton_probs.cpu().numpy()
+        mask_preds_np = mask_preds.cpu().numpy()
+        skeleton_preds_np = skeleton_preds.cpu().numpy()
+
+        # Create figure
+        fig, axes = plt.subplots(num_samples, 5, figsize=(20, 4 * num_samples))
+        if num_samples == 1:
+            axes = axes.reshape(1, -1)
+
+        for i in range(num_samples):
+            # Input image
+            axes[i, 0].imshow(sample_images_np[i, 0], cmap='gray', vmin=0, vmax=1)
+            axes[i, 0].set_title('Input')
+            axes[i, 0].axis('off')
+
+            # Ground truth mask
+            axes[i, 1].imshow(sample_masks_np[i, 0], cmap='gray', vmin=0, vmax=1)
+            axes[i, 1].set_title('GT Mask')
+            axes[i, 1].axis('off')
+
+            # Predicted mask (probability)
+            axes[i, 2].imshow(mask_probs_np[i, 0], cmap='gray', vmin=0, vmax=1)
+            axes[i, 2].set_title(f'Pred Mask (Dice: {dice_scores[i]:.3f})')
+            axes[i, 2].axis('off')
+
+            # Ground truth skeleton
+            axes[i, 3].imshow(sample_skeletons_np[i, 0], cmap='gray', vmin=0, vmax=1)
+            axes[i, 3].set_title('GT Skeleton')
+            axes[i, 3].axis('off')
+
+            # Predicted skeleton
+            axes[i, 4].imshow(skeleton_probs_np[i, 0], cmap='gray', vmin=0, vmax=1)
+            axes[i, 4].set_title('Pred Skeleton')
+            axes[i, 4].axis('off')
+
+        plt.suptitle(f'Epoch {epoch} - Validation Predictions', fontsize=14, fontweight='bold')
+        plt.tight_layout()
+
+        # Save figure
+        save_path = vis_dir / f"val_epoch_{epoch:02d}.png"
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"  [Visualization] Saved: {save_path}")
+
+        # Display inline for Kaggle/Jupyter
+        plt.show()
+        plt.close()
+
+        eval_model.train()
 
     @torch.no_grad()
     def _validate(self, epoch: int) -> Dict[str, float]:
