@@ -121,24 +121,10 @@ Examples:
             from torch.cuda.amp import autocast, GradScaler
             use_new_amp = False
         
-        # Debug: Print actual data path structure
-        if not use_ddp or local_rank == 0:
-            print(f"Data root path: {args.data_root}")
-            print(f"Checking for train directories:")
-            for path in [
-                Path(args.data_root) / "train" / "train_images",
-                Path(args.data_root) / "train_images",
-                Path(args.data_root) / "train"
-            ]:
-                print(f"  {path}: exists={path.exists()}")
-        
-        from model import MicroFilNet
-        from losses import MicroFilNetLoss
-        from dataset import SolarFilamentDataset, create_dataloaders, collate_fn
-        from utils import ModelEMA, save_checkpoint, load_checkpoint
-        
         # Setup distributed training if multiple GPUs
         use_ddp = args.num_gpus > 1 and torch.cuda.device_count() >= args.num_gpus
+        local_rank = 0
+        
         if use_ddp:
             # Check if running with torchrun (proper DDP)
             if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
@@ -163,6 +149,22 @@ Examples:
                 device = torch.device('cpu')
             else:
                 device = torch.device(args.device)
+        
+        # Debug: Print actual data path structure
+        if not use_ddp or local_rank == 0:
+            print(f"Data root path: {args.data_root}")
+            print(f"Checking for train directories:")
+            for path in [
+                Path(args.data_root) / "train" / "train_images",
+                Path(args.data_root) / "train_images",
+                Path(args.data_root) / "train"
+            ]:
+                print(f"  {path}: exists={path.exists()}")
+        
+        from model import MicroFilNet
+        from losses import MicroFilNetLoss
+        from dataset import SolarFilamentDataset, create_dataloaders, collate_fn
+        from utils import ModelEMA, save_checkpoint, load_checkpoint
         
         print(f"Using device: {device}")
         
