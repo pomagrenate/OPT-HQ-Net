@@ -9,14 +9,15 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
 from dataset import SolarFilamentDataset, solar_collate_fn
-from inference import tiled_predict
+from inference import postprocess_mask, tiled_predict
 from losses import MicroFilNetLoss
 from model import MicroFilNet
+from preprocessing import detect_solar_disk
 from utils import (
     ModelEMA,
     binary_mask_to_rle,
@@ -33,9 +34,9 @@ def parse_args():
     train_parser = subparsers.add_parser("train")
     train_parser.add_argument("--data_root", type=str, required=True)
     train_parser.add_argument("--use_cache", action="store_true", default=True)
-    train_parser.add_argument("--tile_size", type=int, default=256)
+    train_parser.add_argument("--tile_size", type=int, default=512)
     train_parser.add_argument("--overlap", type=float, default=0.25)
-    train_parser.add_argument("--batch_size", type=int, default=8)
+    train_parser.add_argument("--batch_size", type=int, default=4)
     train_parser.add_argument("--epochs", type=int, default=50)
     train_parser.add_argument("--lr", type=float, default=1e-4)
     train_parser.add_argument("--weight_decay", type=float, default=1e-5)
@@ -54,29 +55,20 @@ def parse_args():
     predict_parser.add_argument("--weights", type=str, required=True)
     predict_parser.add_argument("--data_root", type=str, required=True)
     predict_parser.add_argument("--use_cache", action="store_true", default=True)
-    predict_parser.add_argument("--tile_size", type=int, default=256)
+    predict_parser.add_argument("--tile_size", type=int, default=512)
     predict_parser.add_argument("--overlap", type=float, default=0.25)
     predict_parser.add_argument("--threshold", type=float, default=0.5)
     predict_parser.add_argument("--min_area", type=int, default=30)
     predict_parser.add_argument("--close_kernel", type=int, default=3)
     predict_parser.add_argument("--output", type=str, default="submission.csv")
     predict_parser.add_argument("--device", type=str, default="cuda")
-    predict_parser.add_argument("--batch_size", type=int, default=8)
+    predict_parser.add_argument("--batch_size", type=int, default=4)
 
     return parser.parse_args()
 
 
-def postprocess_and_extract_components(
-    prob_map: np.ndarray,
-    threshold: float = 0.5,
-    close_kernel_px: int = 3,
-    min_area_px: int = 30,
-) -> list[np.ndarray]:
-    binary = (prob_map >= threshold).astype(np.uint8)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_kernel_px, close_kernel_px))
-    closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(closed, connectivity=8)
-
+def extract_components_from_binary(binary: np.ndarray, min_area_px: int = 30) -> list[np.ndarray]:
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
     components = []
     for lbl in range(1, n_labels):
         if stats[lbl, cv2.CC_STAT_AREA] >= min_area_px:
@@ -85,45 +77,81 @@ def postprocess_and_extract_components(
     return components
 
 
-def save_validation_plots(
+def save_full_disk_validation_plot(
     model: torch.nn.Module,
-    val_loader: DataLoader,
+    val_subset: Subset,
     device: torch.device,
     epoch: int,
     out_dir: Path,
+    tile_size: int = 512,
+    overlap: float = 0.25,
 ):
     out_dir.mkdir(parents=True, exist_ok=True)
     model.eval()
 
-    with torch.no_grad():
-        for batch in val_loader:
-            images = batch["image"].to(device, non_blocking=True)
-            masks = batch["mask"].to(device, non_blocking=True)
-            logits = model(images)
-            preds = (torch.sigmoid(logits.float()) > 0.5).float()
-
-            n_samples = min(images.size(0), 4)
-            fig, axes = plt.subplots(n_samples, 3, figsize=(12, 3 * n_samples))
-            if n_samples == 1:
-                axes = np.expand_dims(axes, 0)
-
-            for i in range(n_samples):
-                axes[i, 0].imshow(images[i, 0].cpu().numpy(), cmap="gray")
-                axes[i, 0].set_title("Input (H-alpha)")
-                axes[i, 0].axis("off")
-
-                axes[i, 1].imshow(masks[i, 0].cpu().numpy(), cmap="gray")
-                axes[i, 1].set_title("Ground Truth")
-                axes[i, 1].axis("off")
-
-                axes[i, 2].imshow(preds[i, 0].cpu().numpy(), cmap="gray")
-                axes[i, 2].set_title("Prediction")
-                axes[i, 2].axis("off")
-
-            plt.tight_layout()
-            plt.savefig(out_dir / f"val_epoch_{epoch + 1}.png", dpi=120, bbox_inches="tight")
-            plt.close()
+    underlying_dataset: SolarFilamentDataset = val_subset.dataset
+    chosen_idx = val_subset.indices[0]
+    for idx in val_subset.indices:
+        file_name = underlying_dataset.image_files[idx].name
+        gt_mask = underlying_dataset._generate_mask(file_name, fallback_shape=(2048, 2048))
+        if gt_mask is not None and gt_mask.sum() > 50:
+            chosen_idx = idx
             break
+
+    raw_path = underlying_dataset.image_files[chosen_idx]
+    raw_img = underlying_dataset._read_image(raw_path)
+
+    if raw_img.ndim == 3 and raw_img.shape[0] == 2:
+        image_stack = raw_img
+    else:
+        lo, hi = np.percentile(raw_img, [1.0, 99.0])
+        norm_img = np.clip((raw_img - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
+        ridge = underlying_dataset._compute_ridge_prior(norm_img)
+        image_stack = np.stack([norm_img, ridge], axis=0).astype(np.float32)
+
+    h, w = image_stack.shape[1], image_stack.shape[2]
+    valid_mask = np.ones((1, h, w), dtype=np.float32)
+
+    u8_disk = (np.clip(image_stack[0], 0.0, 1.0) * 255.0).astype(np.uint8)
+    cx, cy, r_sun = detect_solar_disk(u8_disk)
+
+    global_img = cv2.resize(image_stack[0], (512, 512), interpolation=cv2.INTER_AREA)
+    global_ridge = cv2.resize(image_stack[1], (512, 512), interpolation=cv2.INTER_AREA)
+    global_stack = np.stack([global_img, global_ridge], axis=0).astype(np.float32)
+
+    prob_map = tiled_predict(
+        model=model,
+        image=image_stack,
+        valid_mask=valid_mask,
+        global_image=global_stack,
+        disk_center=(cx, cy, r_sun),
+        tile=tile_size,
+        overlap=overlap,
+        device=device,
+        batch_size=4,
+    )
+
+    pred_mask = (prob_map >= 0.5).astype(np.float32)
+    gt_mask = underlying_dataset._generate_mask(raw_path.name, fallback_shape=(h, w))
+    if gt_mask is None:
+        gt_mask = np.zeros((h, w), dtype=np.float32)
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    axes[0].imshow(image_stack[0], cmap="gray")
+    axes[0].set_title(f"H-alpha Full Disk ({h}x{w})")
+    axes[0].axis("off")
+
+    axes[1].imshow(gt_mask, cmap="gray")
+    axes[1].set_title(f"Ground Truth ({int(gt_mask.sum())} px)")
+    axes[1].axis("off")
+
+    axes[2].imshow(pred_mask, cmap="gray")
+    axes[2].set_title(f"Prediction ({int(pred_mask.sum())} px)")
+    axes[2].axis("off")
+
+    plt.tight_layout()
+    plt.savefig(out_dir / f"val_full_disk_epoch_{epoch + 1}.png", dpi=150, bbox_inches="tight")
+    plt.close()
 
 
 def run_training(args):
@@ -175,7 +203,7 @@ def run_training(args):
             start_epoch = info["epoch"] + 1
             best_loss = info["loss"]
 
-    full_dataset = SolarFilamentDataset(
+    full_train_dataset = SolarFilamentDataset(
         data_root=args.data_root,
         split="train",
         tile_size=args.tile_size,
@@ -184,15 +212,26 @@ def run_training(args):
         augment=True,
     )
 
-    total_len = len(full_dataset)
+    full_val_dataset = SolarFilamentDataset(
+        data_root=args.data_root,
+        split="train",
+        tile_size=args.tile_size,
+        overlap=args.overlap,
+        use_cache=args.use_cache,
+        augment=False,
+    )
+
+    total_len = len(full_train_dataset)
     val_len = int(total_len * args.val_split)
     train_len = total_len - val_len
 
-    train_ds, val_ds = torch.utils.data.random_split(
-        full_dataset,
-        [train_len, val_len],
-        generator=torch.Generator().manual_seed(42),
-    )
+    generator = torch.Generator().manual_seed(42)
+    shuffled_indices = torch.randperm(total_len, generator=generator).tolist()
+    train_indices = shuffled_indices[:train_len]
+    val_indices = shuffled_indices[train_len:]
+
+    train_ds = Subset(full_train_dataset, train_indices)
+    val_ds = Subset(full_val_dataset, val_indices)
 
     train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True) if use_ddp else None
     val_sampler = DistributedSampler(val_ds, num_replicas=world_size, rank=rank, shuffle=False) if (use_ddp and val_len > 0) else None
@@ -236,13 +275,15 @@ def run_training(args):
         iterator = tqdm(train_loader, desc=f"Epoch {epoch + 1}", leave=False) if rank == 0 else train_loader
         for batch in iterator:
             images = batch["image"].to(device, non_blocking=True)
+            global_images = batch["global_image"].to(device, non_blocking=True)
+            coords = batch["coords"].to(device, non_blocking=True)
             valid_masks = batch["valid_mask"].to(device, non_blocking=True)
             masks = batch["mask"].to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
 
             with torch.amp.autocast(device_type=device.type, enabled=(args.use_amp and device.type == "cuda")):
-                logits = model(images)
+                logits = model(images, global_images, coords)
 
             loss, _ = criterion(logits.float(), masks.float(), valid_masks.float(), epoch)
 
@@ -273,9 +314,11 @@ def run_training(args):
             with torch.no_grad():
                 for batch in val_loader:
                     images = batch["image"].to(device, non_blocking=True)
+                    global_images = batch["global_image"].to(device, non_blocking=True)
+                    coords = batch["coords"].to(device, non_blocking=True)
                     valid_masks = batch["valid_mask"].to(device, non_blocking=True)
                     masks = batch["mask"].to(device, non_blocking=True)
-                    logits = eval_target(images)
+                    logits = eval_target(images, global_images, coords)
                     l_val, _ = criterion(logits.float(), masks.float(), valid_masks.float(), epoch)
                     val_loss += l_val.item()
 
@@ -289,7 +332,15 @@ def run_training(args):
                 current_loss = val_loss
 
             if rank == 0:
-                save_validation_plots(eval_target, val_loader, device, epoch, val_plot_dir)
+                save_full_disk_validation_plot(
+                    model=eval_target,
+                    val_subset=val_ds,
+                    device=device,
+                    epoch=epoch,
+                    out_dir=val_plot_dir,
+                    tile_size=args.tile_size,
+                    overlap=args.overlap,
+                )
 
         scheduler.step()
 
@@ -359,25 +410,30 @@ def run_prediction(args):
             sample = test_dataset[idx]
             image_id = sample["image_id"]
             image = sample["image"].numpy()
+            global_image = sample["global_image"].numpy()
             valid_mask = sample["valid_mask"].numpy()
+            disk = sample["disk"]
 
             prob_map = tiled_predict(
-                model,
-                image,
-                valid_mask,
+                model=model,
+                image=image,
+                valid_mask=valid_mask,
+                global_image=global_image,
+                disk_center=disk,
                 tile=args.tile_size,
                 overlap=args.overlap,
                 device=device,
                 batch_size=args.batch_size,
             )
 
-            components = postprocess_and_extract_components(
+            binary = postprocess_mask(
                 prob_map,
                 threshold=args.threshold,
                 close_kernel_px=args.close_kernel,
                 min_area_px=args.min_area,
             )
 
+            components = extract_components_from_binary(binary, min_area_px=args.min_area)
             predictions[image_id] = [binary_mask_to_rle(c) for c in components]
 
     create_submission_csv(predictions, args.output)

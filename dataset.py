@@ -19,6 +19,7 @@ except ImportError:
 from preprocessing import (
     class_balanced_sample,
     continuity_safe_augment,
+    detect_solar_disk,
     extract_tiles,
 )
 
@@ -30,11 +31,12 @@ class SolarFilamentDataset(Dataset):
         self,
         data_root: str | Path,
         split: str = 'train',
-        tile_size: int = 256,
+        tile_size: int = 512,
         overlap: float = 0.25,
         use_cache: bool = True,
         use_mmap: bool = True,
         augment: bool = False,
+        global_size: int = 512,
         transform: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
     ) -> None:
         super().__init__()
@@ -45,6 +47,7 @@ class SolarFilamentDataset(Dataset):
         self.use_cache = use_cache
         self.use_mmap = use_mmap
         self.augment = augment and (self.split == 'train')
+        self.global_size = global_size
         self.transform = transform
 
         self.image_dir = self._resolve_image_dir()
@@ -94,7 +97,6 @@ class SolarFilamentDataset(Dataset):
             self.data_root / "annotations.json",
         ]
         ann_path = next((p for p in candidate_files if p.is_file()), None)
-
         if ann_path is None:
             return
 
@@ -196,6 +198,13 @@ class SolarFilamentDataset(Dataset):
         else:
             raise ValueError(f"Unexpected image shape {raw_arr.shape} at {img_path}")
 
+        u8_disk = (np.clip(image_stack[0], 0.0, 1.0) * 255.0).astype(np.uint8)
+        cx, cy, r_sun = detect_solar_disk(u8_disk)
+
+        global_img = cv2.resize(image_stack[0], (self.global_size, self.global_size), interpolation=cv2.INTER_AREA)
+        global_ridge = cv2.resize(image_stack[1], (self.global_size, self.global_size), interpolation=cv2.INTER_AREA)
+        global_stack = np.stack([global_img, global_ridge], axis=0).astype(np.float32)
+
         valid_mask = np.ones((1, h, w), dtype=np.float32)
 
         if self.split == 'train':
@@ -226,8 +235,18 @@ class SolarFilamentDataset(Dataset):
                     img_tile, gt_tile, valid_tile
                 )
 
+            center_y = ty + self.tile_size / 2.0
+            center_x = tx + self.tile_size / 2.0
+            x_norm = center_x / float(w)
+            y_norm = center_y / float(h)
+            dist_sun = np.sqrt((center_x - cx) ** 2 + (center_y - cy) ** 2)
+            r_norm = dist_sun / max(float(r_sun), 1.0)
+            coords = np.array([x_norm, y_norm, r_norm], dtype=np.float32)
+
             sample: Dict[str, Any] = {
                 'image': torch.from_numpy(np.ascontiguousarray(img_tile)).float(),
+                'global_image': torch.from_numpy(np.ascontiguousarray(global_stack)).float(),
+                'coords': torch.from_numpy(coords).float(),
                 'valid_mask': torch.from_numpy(np.ascontiguousarray(valid_tile)).float(),
                 'mask': torch.from_numpy(np.ascontiguousarray(gt_tile)).float().unsqueeze(0),
                 'has_filament': has_fil,
@@ -235,9 +254,10 @@ class SolarFilamentDataset(Dataset):
                 'image_id': img_path.stem,
             }
         else:
-            disk_meta = (w // 2, h // 2, min(h, w) // 2)
+            disk_meta = (cx, cy, r_sun)
             sample = {
                 'image': torch.from_numpy(np.ascontiguousarray(image_stack)).float(),
+                'global_image': torch.from_numpy(np.ascontiguousarray(global_stack)).float(),
                 'valid_mask': torch.from_numpy(np.ascontiguousarray(valid_mask)).float(),
                 'mask': None,
                 'image_id': img_path.stem,
@@ -259,6 +279,8 @@ def solar_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     if has_mask:
         return {
             'image': torch.stack([b['image'] for b in batch], dim=0),
+            'global_image': torch.stack([b['global_image'] for b in batch], dim=0),
+            'coords': torch.stack([b['coords'] for b in batch], dim=0),
             'valid_mask': torch.stack([b['valid_mask'] for b in batch], dim=0),
             'mask': torch.stack([b['mask'] for b in batch], dim=0),
             'has_filament': torch.tensor([b['has_filament'] for b in batch], dtype=torch.bool),
@@ -268,6 +290,7 @@ def solar_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     return {
         'image': [b['image'] for b in batch],
+        'global_image': [b['global_image'] for b in batch],
         'valid_mask': [b['valid_mask'] for b in batch],
         'image_id': [b['image_id'] for b in batch],
         'disk': [b.get('disk') for b in batch],
@@ -277,7 +300,7 @@ def solar_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
 def create_dataloaders(
     data_root: str | Path,
     batch_size: int = 8,
-    tile_size: int = 256,
+    tile_size: int = 512,
     overlap: float = 0.25,
     val_split: float = 0.1,
     num_workers: int = 4,
