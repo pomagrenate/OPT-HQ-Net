@@ -65,8 +65,6 @@ Examples:
                              help='Use exponential moving average')
     train_parser.add_argument('--device', type=str, default='cuda',
                              help='Device to use (cuda/cpu)')
-    train_parser.add_argument('--num_gpus', type=int, default=2,
-                             help='Number of GPUs to use for DDP training')
     
     # Inference command
     predict_parser = subparsers.add_parser('predict', help='Run inference')
@@ -112,6 +110,9 @@ Examples:
         import torch.nn as nn
         import torch.optim as optim
         from torch.utils.data import DataLoader
+        import torch.distributed as dist
+        from torch.nn.parallel import DistributedDataParallel as DDP
+        from torch.utils.data.distributed import DistributedSampler
         
         # Import autocast for AMP
         try:
@@ -121,34 +122,39 @@ Examples:
             from torch.cuda.amp import autocast, GradScaler
             use_new_amp = False
         
-        # Setup distributed training if multiple GPUs
-        use_ddp = args.num_gpus > 1 and torch.cuda.device_count() >= args.num_gpus
+        # ========================================
+        # DDP Initialization
+        # ========================================
+        rank = 0
+        world_size = 1
+        use_ddp = False
         local_rank = 0
         
-        if use_ddp:
-            # Check if running with torchrun (proper DDP)
-            if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
-                print(f"Using DDP with {args.num_gpus} GPUs (torchrun)")
-                torch.distributed.init_process_group(backend='nccl')
-                local_rank = int(os.environ.get('LOCAL_RANK', 0))
-                torch.cuda.set_device(local_rank)
-                device = torch.device(f'cuda:{local_rank}')
-            else:
-                # Fallback: if not using torchrun, use single GPU
-                print(f"Warning: --num_gpus {args.num_gpus} specified but not running with torchrun")
-                print(f"Falling back to single GPU training")
-                use_ddp = False
-                if args.device == 'cuda' and not torch.cuda.is_available():
-                    print("CUDA not available, falling back to CPU")
-                    device = torch.device('cpu')
-                else:
-                    device = torch.device(args.device)
+        if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+            use_ddp = True
+            rank = int(os.environ['RANK'])
+            local_rank = int(os.environ.get('LOCAL_RANK', rank))
+            world_size = int(os.environ['WORLD_SIZE'])
+            
+            # Set device BEFORE init_process_group
+            torch.cuda.set_device(local_rank)
+            device = torch.device(f'cuda:{local_rank}')
+            
+            # Initialize process group
+            dist.init_process_group(backend='nccl', init_method='env://')
+            
+            if rank == 0:
+                print(f"DDP initialized: rank={rank}, local_rank={local_rank}, world_size={world_size}")
         else:
+            # Single GPU fallback
             if args.device == 'cuda' and not torch.cuda.is_available():
                 print("CUDA not available, falling back to CPU")
                 device = torch.device('cpu')
             else:
                 device = torch.device(args.device)
+            
+            if rank == 0:
+                print("Running in single-GPU mode")
         
         # Debug: Print actual data path structure
         if not use_ddp or local_rank == 0:
@@ -184,13 +190,16 @@ Examples:
         # Create model
         model = MicroFilNet().to(device)
         
+        # Convert BatchNorm to SyncBatchNorm for DDP
+        if use_ddp:
+            model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+        
         # Wrap with DDP if using multiple GPUs
         if use_ddp:
-            model = torch.nn.parallel.DistributedDataParallel(
-                model, device_ids=[local_rank], output_device=local_rank
-            )
+            model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
         
-        print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+        if rank == 0:
+            print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
         
         criterion = MicroFilNetLoss()
         optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
@@ -229,10 +238,10 @@ Examples:
                 print(f"Resumed from epoch {start_epoch}")
         
         # Create dataloaders
-        print(f"Loading data from: {args.data_root}")
+        if rank == 0:
+            print(f"Loading data from: {args.data_root}")
         
         if use_ddp:
-            from torch.utils.data.distributed import DistributedSampler
             full_dataset = SolarFilamentDataset(
                 data_root=args.data_root,
                 split='train',
@@ -251,8 +260,9 @@ Examples:
                 generator=torch.Generator().manual_seed(42)
             )
             
-            train_sampler = DistributedSampler(train_dataset, num_replicas=args.num_gpus, rank=local_rank)
-            val_sampler = DistributedSampler(val_dataset, num_replicas=args.num_gpus, rank=local_rank, shuffle=False)
+            # Create distributed samplers
+            train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
+            val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
             
             train_loader = DataLoader(
                 train_dataset,
@@ -288,7 +298,7 @@ Examples:
             if use_ddp:
                 train_sampler.set_epoch(epoch)
             
-            if not use_ddp or local_rank == 0:
+            if rank == 0:
                 print(f"\nEpoch {epoch + 1}/{args.epochs}")
                 print("-" * 50)
             
@@ -296,7 +306,7 @@ Examples:
             total_loss = 0.0
             
             # Add progress bar (only on rank 0)
-            if not use_ddp or local_rank == 0:
+            if rank == 0:
                 pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{args.epochs}", leave=False)
                 iterator = pbar
             else:
@@ -333,17 +343,17 @@ Examples:
                 total_loss += loss.item()
                 
                 # Update progress bar (only on rank 0)
-                if not use_ddp or local_rank == 0:
+                if rank == 0:
                     iterator.set_postfix({'loss': f'{loss.item():.4f}'})
             
             avg_loss = total_loss / len(train_loader)
-            if not use_ddp or local_rank == 0:
+            if rank == 0:
                 iterator.close()
                 print(f"Average train loss: {avg_loss:.4f}")
             
             # Validation
             if val_loader is not None:
-                if not use_ddp or local_rank == 0:
+                if rank == 0:
                     print("Running validation...")
                 
                 model.eval()
@@ -362,15 +372,24 @@ Examples:
                         val_loss += loss.item() * images.size(0)
                         val_samples += images.size(0)
                 
-                avg_val_loss = val_loss / val_samples
-                if not use_ddp or local_rank == 0:
-                    print(f"Average val loss: {avg_val_loss:.4f}")
+                # Synchronize validation loss across all ranks
+                if use_ddp:
+                    val_loss_tensor = torch.tensor([val_loss], device=device)
+                    val_samples_tensor = torch.tensor([val_samples], device=device)
+                    dist.all_reduce(val_loss_tensor, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(val_samples_tensor, op=dist.ReduceOp.SUM)
+                    val_loss = val_loss_tensor.item() / val_samples_tensor.item()
+                else:
+                    val_loss = val_loss / val_samples
+                
+                if rank == 0:
+                    print(f"Average val loss: {val_loss:.4f}")
                 
                 # Use validation loss for best model saving
-                current_loss = avg_val_loss
+                current_loss = val_loss
                 
-                # Create visualization plots
-                if not use_ddp or local_rank == 0:
+                # Create visualization plots (only on rank 0)
+                if rank == 0:
                     create_validation_plots(model, val_loader, device, epoch, checkpoint_dir)
             else:
                 current_loss = avg_loss
@@ -378,17 +397,24 @@ Examples:
             scheduler.step()
             
             # Save checkpoints (only on rank 0)
-            is_best = avg_loss < best_loss
+            is_best = current_loss < best_loss
             if is_best:
-                best_loss = avg_loss
+                best_loss = current_loss
             
-            if not use_ddp or local_rank == 0:
-                save_checkpoint(model, optimizer, epoch, avg_loss, checkpoint_dir / 'last.pt', ema, scheduler)
+            if rank == 0:
+                # Unwrap DDP model for saving
+                model_to_save = model.module if use_ddp else model
+                save_checkpoint(model_to_save, optimizer, epoch, current_loss, checkpoint_dir / 'last.pt', ema, scheduler)
                 if is_best:
-                    save_checkpoint(model, optimizer, epoch, avg_loss, checkpoint_dir / 'best_model.pt', ema, scheduler)
+                    save_checkpoint(model_to_save, optimizer, epoch, current_loss, checkpoint_dir / 'best_model.pt', ema, scheduler)
         
         print("\nTraining completed!")
-        print(f"Best loss: {best_loss:.4f}")
+        if rank == 0:
+            print(f"Best loss: {best_loss:.4f}")
+        
+        # Cleanup DDP
+        if use_ddp:
+            dist.destroy_process_group()
         
     elif args.command == 'predict':
         print("=" * 60)
@@ -404,6 +430,7 @@ Examples:
         # Import inference modules
         import torch
         import cv2
+        import torch.distributed as dist
         
         from model import MicroFilNet
         from dataset import SolarFilamentDataset
@@ -411,18 +438,27 @@ Examples:
         from utils import binary_mask_to_rle, create_submission_csv, load_checkpoint
         
         # Setup
-        if args.device == 'cuda' and not torch.cuda.is_available():
-            print("CUDA not available, falling back to CPU")
-            device = torch.device('cpu')
+        rank = 0
+        use_ddp = 'RANK' in os.environ and 'WORLD_SIZE' in os.environ
+        if use_ddp:
+            rank = int(os.environ['RANK'])
+            local_rank = int(os.environ.get('LOCAL_RANK', rank))
+            device = torch.device(f'cuda:{local_rank}')
         else:
-            device = torch.device(args.device)
-        print(f"Using device: {device}")
+            if args.device == 'cuda' and not torch.cuda.is_available():
+                print("CUDA not available, falling back to CPU")
+                device = torch.device('cpu')
+            else:
+                device = torch.device(args.device)
         
-        # Force CUDA if available and requested
-        if device.type == 'cuda':
-            torch.cuda.empty_cache()
-            print(f"GPU: {torch.cuda.get_device_name(0)}")
-            print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
+        if rank == 0:
+            print(f"Using device: {device}")
+            
+            # Force CUDA if available and requested
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()
+                print(f"GPU: {torch.cuda.get_device_name(0)}")
+                print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
         
         # Load model
         model = MicroFilNet().to(device)
