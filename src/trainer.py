@@ -146,7 +146,7 @@ class SolarTrainer:
             try:
                 self.scaler = torch.amp.GradScaler("cuda")
             except AttributeError:
-                self.scaler = torch.cuda.amp.GradScaler()
+                self.scaler = torch.amp.GradScaler('cuda')
         else:
             self.scaler = None
 
@@ -366,9 +366,9 @@ class SolarTrainer:
 
             if self.use_amp:
                 try:
-                    autocast_cm = torch.amp.autocast("cuda")
+                    autocast_cm = torch.amp.autocast('cuda')
                 except AttributeError:
-                    autocast_cm = torch.cuda.amp.autocast()
+                    autocast_cm = torch.amp.autocast('cuda')
 
                 with autocast_cm:
                     preds = self.model(images)
@@ -418,9 +418,9 @@ class SolarTrainer:
 
             if self.use_amp:
                 try:
-                    autocast_cm = torch.amp.autocast("cuda")
+                    autocast_cm = torch.amp.autocast('cuda')
                 except AttributeError:
-                    autocast_cm = torch.cuda.amp.autocast()
+                    autocast_cm = torch.amp.autocast('cuda')
                 with autocast_cm:
                     logits = eval_model(images)
             else:

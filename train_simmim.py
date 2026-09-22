@@ -15,7 +15,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from tqdm import tqdm
 
 from src.simmim import SimMIMSegFormer
@@ -101,7 +101,7 @@ def train_one_epoch(
 
         # Forward pass
         if use_amp:
-            with autocast():
+            with autocast('cuda'):
                 outputs = model(images, mask=mask)
                 reconstructed = outputs['reconstructed']
                 mask = outputs['mask']
@@ -206,7 +206,7 @@ def main():
     )
 
     # AMP scaler
-    scaler = GradScaler() if args.use_amp else None
+    scaler = GradScaler('cuda') if args.use_amp else None
 
     # Training loop
     print(f"Starting training for {args.epochs} epochs...")

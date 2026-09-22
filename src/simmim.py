@@ -180,6 +180,16 @@ class SimMIMSegFormer(nn.Module):
                         setattr(parent, last_name, self._create_1ch_conv(module, in_channels))
                         break
 
+        # Reconstruction decoder
+        self.decoder = SimMIMDecoder(
+            encoder_channels=256,  # SegFormer B0 stage 4 channels
+            hidden_dim=256,
+            output_channels=1,
+        )
+
+        # Mask token embedding (learnable)
+        self.mask_token = nn.Parameter(torch.zeros(1, 256, 1, 1))
+
     def _create_1ch_conv(self, original_proj: nn.Conv2d, in_channels: int) -> nn.Conv2d:
         """Create 1-channel conv from 3-channel conv."""
         original_weight = original_proj.weight

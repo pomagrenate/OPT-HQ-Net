@@ -15,7 +15,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from tqdm import tqdm
 
 from src.segmentation import SolarFilamentSegmentation
@@ -68,7 +68,7 @@ def train_one_epoch(
 
         # Forward pass
         if use_amp:
-            with autocast():
+            with autocast('cuda'):
                 logits = model(images)
                 loss_dict = criterion(logits, masks)
                 loss = loss_dict['loss']
@@ -225,7 +225,7 @@ def main():
     )
 
     # AMP scaler
-    scaler = GradScaler() if args.use_amp else None
+    scaler = GradScaler('cuda') if args.use_amp else None
 
     # Training loop
     print(f"Starting training for {args.epochs} epochs...")
