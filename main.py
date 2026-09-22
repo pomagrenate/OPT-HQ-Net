@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
+import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -10,13 +11,12 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
+from tqdm import tqdm
 
 from dataset import SolarFilamentDataset, solar_collate_fn
 from inference import tiled_predict
 from losses import MicroFilNetLoss
 from model import MicroFilNet
-from predict import postprocess_and_extract_components
-from train import evaluate, train_one_epoch
 from utils import (
     ModelEMA,
     binary_mask_to_rle,
@@ -66,35 +66,60 @@ def parse_args():
     return parser.parse_args()
 
 
-def save_validation_plots(model: torch.nn.Module, val_loader: DataLoader, device: torch.device, epoch: int, out_dir: Path):
+def postprocess_and_extract_components(
+    prob_map: np.ndarray,
+    threshold: float = 0.5,
+    close_kernel_px: int = 3,
+    min_area_px: int = 30,
+) -> list[np.ndarray]:
+    binary = (prob_map >= threshold).astype(np.uint8)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_kernel_px, close_kernel_px))
+    closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(closed, connectivity=8)
+
+    components = []
+    for lbl in range(1, n_labels):
+        if stats[lbl, cv2.CC_STAT_AREA] >= min_area_px:
+            component = (labels == lbl).astype(np.uint8)
+            components.append(component)
+    return components
+
+
+def save_validation_plots(
+    model: torch.nn.Module,
+    val_loader: DataLoader,
+    device: torch.device,
+    epoch: int,
+    out_dir: Path,
+):
     out_dir.mkdir(parents=True, exist_ok=True)
     model.eval()
-    
+
     with torch.no_grad():
         for batch in val_loader:
             images = batch["image"].to(device, non_blocking=True)
             masks = batch["mask"].to(device, non_blocking=True)
             logits = model(images)
             preds = (torch.sigmoid(logits) > 0.5).float()
-            
+
             n_samples = min(images.size(0), 4)
             fig, axes = plt.subplots(n_samples, 3, figsize=(12, 3 * n_samples))
             if n_samples == 1:
                 axes = np.expand_dims(axes, 0)
-                
+
             for i in range(n_samples):
                 axes[i, 0].imshow(images[i, 0].cpu().numpy(), cmap="gray")
                 axes[i, 0].set_title("Input (H-alpha)")
                 axes[i, 0].axis("off")
-                
+
                 axes[i, 1].imshow(masks[i, 0].cpu().numpy(), cmap="gray")
                 axes[i, 1].set_title("Ground Truth")
                 axes[i, 1].axis("off")
-                
+
                 axes[i, 2].imshow(preds[i, 0].cpu().numpy(), cmap="gray")
                 axes[i, 2].set_title("Prediction")
                 axes[i, 2].axis("off")
-                
+
             plt.tight_layout()
             plt.savefig(out_dir / f"val_epoch_{epoch + 1}.png", dpi=120, bbox_inches="tight")
             plt.close()
@@ -141,6 +166,10 @@ def run_training(args):
 
     if args.resume:
         chk_path = Path(args.resume)
+        if chk_path == Path("last"):
+            all_chk = list(checkpoint_dir.glob("checkpoint_*.pt"))
+            chk_path = max(all_chk, key=os.path.getctime) if all_chk else (checkpoint_dir / "last.pt")
+
         if chk_path.exists():
             info = load_checkpoint(str(chk_path), raw_model, optimizer, ema, scheduler, str(device))
             start_epoch = info["epoch"] + 1
@@ -200,24 +229,56 @@ def run_training(args):
         if use_ddp and train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
-        train_metrics = train_one_epoch(
-            model=model,
-            dataloader=train_loader,
-            criterion=criterion,
-            optimizer=optimizer,
-            scaler=scaler,
-            device=device,
-            epoch=epoch,
-            use_amp=(args.use_amp and device.type == "cuda"),
-            ema=ema if rank == 0 else None,
-        )
+        model.train()
+        total_loss = 0.0
+        n_batches = len(train_loader)
 
-        current_loss = train_metrics["total_loss"]
+        iterator = tqdm(train_loader, desc=f"Epoch {epoch + 1}", leave=False) if rank == 0 else train_loader
+        for batch in iterator:
+            images = batch["image"].to(device, non_blocking=True)
+            valid_masks = batch["valid_mask"].to(device, non_blocking=True)
+            masks = batch["mask"].to(device, non_blocking=True)
+
+            optimizer.zero_grad(set_to_none=True)
+
+            with torch.amp.autocast(device_type=device.type, enabled=(args.use_amp and device.type == "cuda")):
+                logits = model(images)
+                loss, _ = criterion(logits, masks, valid_masks, epoch)
+
+            if args.use_amp and scaler is not None:
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
+
+            if ema is not None:
+                ema.update(raw_model)
+
+            loss_val = loss.item()
+            total_loss += loss_val
+            if rank == 0:
+                iterator.set_postfix({"loss": f"{loss_val:.4f}"})
+
+        current_loss = total_loss / max(n_batches, 1)
 
         if val_loader is not None:
             eval_target = ema.shadow_model if (ema is not None and rank == 0) else raw_model
-            val_metrics = evaluate(eval_target, val_loader, criterion, device, epoch)
-            val_loss = val_metrics["total_loss"]
+            eval_target.eval()
+            val_loss = 0.0
+            val_batches = len(val_loader)
+
+            with torch.no_grad():
+                for batch in val_loader:
+                    images = batch["image"].to(device, non_blocking=True)
+                    valid_masks = batch["valid_mask"].to(device, non_blocking=True)
+                    masks = batch["mask"].to(device, non_blocking=True)
+                    logits = eval_target(images)
+                    l_val, _ = criterion(logits, masks, valid_masks, epoch)
+                    val_loss += l_val.item()
+
+            val_loss = val_loss / max(val_batches, 1)
 
             if use_ddp:
                 loss_tensor = torch.tensor([val_loss], device=device)
