@@ -1,14 +1,7 @@
-"""
-Training script for MicroFilNet solar filament segmentation.
-
-Usage:
-    python train.py --data_root /path/to/MAGFiLO_1.0_Kaggle_2026/train --epochs 50 --batch_size 4
-"""
-
 from __future__ import annotations
+
 import argparse
 import os
-import time
 from pathlib import Path
 from typing import Optional
 from tqdm import tqdm
@@ -18,322 +11,253 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 
-from model import MicroFilNet
+from dataset import SolarFilamentDataset, solar_collate_fn
 from losses import MicroFilNetLoss
-from dataset import SolarFilamentDataset, create_dataloaders
-from utils import ModelEMA, save_checkpoint, load_checkpoint
+from model import MicroFilNet
+from utils import ModelEMA, load_checkpoint, save_checkpoint
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Train MicroFilNet for solar filament segmentation')
-    
-    # Data arguments
-    parser.add_argument('--data_root', type=str, required=True,
-                       help='Path to the training data directory')
-    parser.add_argument('--use_cache', action='store_true', default=True,
-                       help='Use cached .npy files if available')
-    
-    # Model arguments
-    parser.add_argument('--tile_size', type=int, default=256,
-                       help='Tile size for training patches (larger = better GPU utilization)')
-    parser.add_argument('--overlap', type=float, default=0.25,
-                       help='Overlap fraction for tiling')
-    
-    # Training arguments
-    parser.add_argument('--batch_size', type=int, default=4,
-                       help='Batch size for training (increase for better GPU utilization)')
-    parser.add_argument('--epochs', type=int, default=50,
-                       help='Number of training epochs')
-    parser.add_argument('--lr', type=float, default=1e-4,
-                       help='Learning rate')
-    parser.add_argument('--weight_decay', type=float, default=1e-5,
-                       help='Weight decay')
-    
-    # Training options
-    parser.add_argument('--use_amp', action='store_true',
-                       help='Use automatic mixed precision training')
-    parser.add_argument('--num_workers', type=int, default=2,
-                       help='Number of data loading workers')
-    
-    # Checkpointing
-    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints',
-                       help='Directory to save checkpoints')
-    parser.add_argument('--resume', type=str, default=None,
-                       help='Path to checkpoint to resume from (or "last" for latest)')
-    parser.add_argument('--save_interval', type=int, default=5,
-                       help='Save checkpoint every N epochs')
-    
-    # Device
-    parser.add_argument('--device', type=str, default='cuda',
-                       help='Device to use (cuda/cpu)')
-    
-    # EMA
-    parser.add_argument('--use_ema', action='store_true',
-                       help='Use exponential moving average of model weights')
-    parser.add_argument('--ema_decay', type=float, default=0.9999,
-                       help='EMA decay rate')
-    
+    parser = argparse.ArgumentParser(description="Train MicroFilNet")
+    parser.add_argument("--data_root", type=str, required=True)
+    parser.add_argument("--use_cache", action="store_true", default=True)
+    parser.add_argument("--tile_size", type=int, default=256)
+    parser.add_argument("--overlap", type=float, default=0.25)
+    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--weight_decay", type=float, default=1e-5)
+    parser.add_argument("--use_amp", action="store_true")
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--checkpoint_dir", type=str, default="checkpoints")
+    parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument("--save_interval", type=int, default=5)
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--use_ema", action="store_true")
+    parser.add_argument("--ema_decay", type=float, default=0.9999)
+    parser.add_argument("--val_split", type=float, default=0.1)
     return parser.parse_args()
 
 
-def train_epoch(model: nn.Module, dataloader: DataLoader, criterion: nn.Module,
-                optimizer: optim.Optimizer, device: str, epoch: int,
-                use_amp: bool = False, scaler: Optional[GradScaler] = None,
-                ema: Optional[ModelEMA] = None, use_new_amp: bool = False) -> dict:
-    """Train for one epoch."""
+def train_one_epoch(
+    model: nn.Module,
+    dataloader: DataLoader,
+    criterion: nn.Module,
+    optimizer: optim.Optimizer,
+    scaler: Optional[torch.amp.GradScaler],
+    device: torch.device,
+    epoch: int,
+    use_amp: bool,
+    ema: Optional[ModelEMA] = None,
+) -> dict[str, float]:
     model.train()
-    
     total_loss = 0.0
-    loss_components = {
-        'bce': 0.0,
-        'dice': 0.0,
-        'cldice': 0.0,
-        'boundary': 0.0
-    }
-    
-    num_batches = len(dataloader)
-    
-    # Add progress bar
-    pbar = tqdm(dataloader, desc=f"Epoch {epoch}", leave=False)
-    
-    for batch_idx, batch in enumerate(pbar):
-        images = batch['image'].to(device)
-        valid_masks = batch['valid_mask'].to(device)
-        masks = batch['mask'].to(device)
-        
-        optimizer.zero_grad()
-        
-        if use_amp:
-            if use_new_amp:
-                with autocast(device_type='cuda'):
-                    logits = model(images)
-                    loss, parts = criterion(logits, masks, valid_masks, epoch)
-            else:
-                with autocast():
-                    logits = model(images)
-                    loss, parts = criterion(logits, masks, valid_masks, epoch)
-            
+    accum_parts = {"bce": 0.0, "dice": 0.0, "cldice": 0.0, "boundary": 0.0}
+    n_batches = len(dataloader)
+
+    pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}", leave=False)
+    for batch in pbar:
+        images = batch["image"].to(device, non_blocking=True)
+        valid_masks = batch["valid_mask"].to(device, non_blocking=True)
+        masks = batch["mask"].to(device, non_blocking=True)
+
+        optimizer.zero_grad(set_to_none=True)
+
+        with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+            logits = model(images)
+            loss, parts = criterion(logits, masks, valid_masks, epoch)
+
+        if use_amp and scaler is not None:
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
         else:
-            logits = model(images)
-            loss, parts = criterion(logits, masks, valid_masks, epoch)
             loss.backward()
             optimizer.step()
-        
-        # Update EMA if enabled
+
         if ema is not None:
-            ema.update()
-        
-        # Accumulate losses
-        total_loss += loss.item()
-        for key in loss_components:
-            loss_components[key] += parts[key].item()
-        
-        # Update progress bar
-        pbar.set_postfix({
-            'loss': f'{loss.item():.4f}',
-            'bce': f'{parts["bce"]:.4f}',
-            'dice': f'{parts["dice"]:.4f}'
-        })
-    
-    # Average losses
-    pbar.close()
-    avg_loss = total_loss / num_batches
-    for key in loss_components:
-        loss_components[key] /= num_batches
-    
-    return {
-        'total_loss': avg_loss,
-        **loss_components
-    }
+            ema.update(model)
+
+        loss_val = loss.item()
+        total_loss += loss_val
+        for k in accum_parts:
+            accum_parts[k] += parts[k].item()
+
+        pbar.set_postfix({"loss": f"{loss_val:.4f}"})
+
+    metrics = {k: v / max(n_batches, 1) for k, v in accum_parts.items()}
+    metrics["total_loss"] = total_loss / max(n_batches, 1)
+    return metrics
 
 
-def validate(model: nn.Module, dataloader: DataLoader, criterion: nn.Module,
-             device: str, epoch: int) -> dict:
-    """Validate the model."""
+@torch.no_grad()
+def evaluate(
+    model: nn.Module,
+    dataloader: DataLoader,
+    criterion: nn.Module,
+    device: torch.device,
+    epoch: int,
+) -> dict[str, float]:
     model.eval()
-    
     total_loss = 0.0
-    loss_components = {
-        'bce': 0.0,
-        'dice': 0.0,
-        'cldice': 0.0,
-        'boundary': 0.0
-    }
-    
-    num_batches = len(dataloader)
-    
-    with torch.no_grad():
-        # Add progress bar for validation
-        pbar = tqdm(dataloader, desc="Validation", leave=False)
-        for batch in pbar:
-            images = batch['image'].to(device)
-            valid_masks = batch['valid_mask'].to(device)
-            masks = batch['mask'].to(device)
-            
-            logits = model(images)
-            loss, parts = criterion(logits, masks, valid_masks, epoch)
-            
-            total_loss += loss.item()
-            for key in loss_components:
-                loss_components[key] += parts[key].item()
-            
-            # Update progress bar
-            pbar.set_postfix({'val_loss': f'{loss.item():.4f}'})
-    
-    # Average losses
-    pbar.close()
-    avg_loss = total_loss / num_batches
-    for key in loss_components:
-        loss_components[key] /= num_batches
-    
-    return {
-        'total_loss': avg_loss,
-        **loss_components
-    }
+    accum_parts = {"bce": 0.0, "dice": 0.0, "cldice": 0.0, "boundary": 0.0}
+    n_batches = len(dataloader)
+
+    for batch in dataloader:
+        images = batch["image"].to(device, non_blocking=True)
+        valid_masks = batch["valid_mask"].to(device, non_blocking=True)
+        masks = batch["mask"].to(device, non_blocking=True)
+
+        logits = model(images)
+        loss, parts = criterion(logits, masks, valid_masks, epoch)
+
+        total_loss += loss.item()
+        for k in accum_parts:
+            accum_parts[k] += parts[k].item()
+
+    metrics = {k: v / max(n_batches, 1) for k, v in accum_parts.items()}
+    metrics["total_loss"] = total_loss / max(n_batches, 1)
+    return metrics
 
 
 def main():
     args = parse_args()
-    
-    # Create checkpoint directory
+
     checkpoint_dir = Path(args.checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Set device
-    if args.device == 'cuda' and not torch.cuda.is_available():
-        print("CUDA not available, falling back to CPU")
-        device = torch.device('cpu')
-    else:
-        device = torch.device(args.device)
-    print(f"Using device: {device}")
-    
-    # Force CUDA if available and requested
-    if device.type == 'cuda':
-        torch.cuda.empty_cache()
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
-        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
-    
-    # Create model
-    model = MicroFilNet().to(device)
-    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
-    
-    # Create loss function
-    criterion = MicroFilNetLoss()
-    
-    # Create optimizer
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    
-    # Create scheduler
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-    
-    # Create EMA if enabled
-    ema = None
-    if args.use_ema:
-        ema = ModelEMA(model, decay=args.ema_decay, device=device)
-    
-    # Create gradient scaler for AMP
-    use_new_amp = False
-    scaler = None
-    if args.use_amp:
-        try:
-            from torch.amp import autocast, GradScaler
-            scaler = GradScaler()
-            use_new_amp = True
-        except ImportError:
-            from torch.cuda.amp import autocast, GradScaler
-            scaler = GradScaler()
-    
-    # Load checkpoint if resuming
-    start_epoch = 0
-    best_loss = float('inf')
-    
-    if args.resume:
-        if args.resume == 'last':
-            # Find the most recent checkpoint
-            checkpoints = list(checkpoint_dir.glob('checkpoint_*.pt'))
-            if checkpoints:
-                checkpoint_path = max(checkpoints, key=os.path.getctime)
-            else:
-                checkpoint_path = checkpoint_dir / 'last.pt'
-        else:
-            checkpoint_path = Path(args.resume)
-        
-        if checkpoint_path.exists():
-            info = load_checkpoint(
-                checkpoint_path, model, optimizer, ema, scheduler, device
-            )
-            start_epoch = info['epoch'] + 1
-            best_loss = info['loss']
-            print(f"Resumed from epoch {start_epoch}")
-        else:
-            print(f"Checkpoint not found: {checkpoint_path}")
-    
-    # Create dataloaders
-    print(f"Loading data from: {args.data_root}")
-    train_loader, val_loader = create_dataloaders(
-        data_root=args.data_root,
-        batch_size=args.batch_size,
-        tile_size=args.tile_size,
-        num_workers=args.num_workers,
-        use_cache=args.use_cache
+
+    device = torch.device(
+        args.device if (args.device == "cuda" and torch.cuda.is_available()) else "cpu"
     )
-    
-    print(f"Training batches: {len(train_loader)}")
-    
-    # Training loop
-    for epoch in range(start_epoch, args.epochs):
-        print(f"\nEpoch {epoch + 1}/{args.epochs}")
-        print("-" * 50)
-        
-        # Train
-        train_metrics = train_epoch(
-            model, train_loader, criterion, optimizer, device, epoch,
-            use_amp=args.use_amp, scaler=scaler, ema=ema, use_new_amp=use_new_amp
+
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    model = MicroFilNet().to(device)
+    criterion = MicroFilNetLoss()
+    optimizer = optim.AdamW(
+        model.parameters(), lr=args.lr, weight_decay=args.weight_decay
+    )
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+
+    ema = ModelEMA(model, decay=args.ema_decay, device=device) if args.use_ema else None
+    scaler = torch.amp.GradScaler("cuda") if (args.use_amp and device.type == "cuda") else None
+
+    start_epoch = 0
+    best_loss = float("inf")
+
+    if args.resume:
+        chk_path = Path(args.resume)
+        if chk_path == Path("last"):
+            all_chk = list(checkpoint_dir.glob("checkpoint_*.pt"))
+            chk_path = max(all_chk, key=os.path.getctime) if all_chk else (checkpoint_dir / "last.pt")
+
+        if chk_path.exists():
+            info = load_checkpoint(str(chk_path), model, optimizer, ema, scheduler, str(device))
+            start_epoch = info["epoch"] + 1
+            best_loss = info["loss"]
+
+    full_dataset = SolarFilamentDataset(
+        data_root=args.data_root,
+        split="train",
+        tile_size=args.tile_size,
+        overlap=args.overlap,
+        use_cache=args.use_cache,
+        augment=True,
+    )
+
+    total_len = len(full_dataset)
+    val_len = int(total_len * args.val_split)
+    train_len = total_len - val_len
+
+    train_ds, val_ds = torch.utils.data.random_split(
+        full_dataset,
+        [train_len, val_len],
+        generator=torch.Generator().manual_seed(42),
+    )
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
+        collate_fn=solar_collate_fn,
+        drop_last=True,
+        persistent_workers=(args.num_workers > 0),
+    )
+
+    val_loader = (
+        DataLoader(
+            val_ds,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=(device.type == "cuda"),
+            collate_fn=solar_collate_fn,
+            drop_last=False,
+            persistent_workers=(args.num_workers > 0),
         )
-        
-        print(f"Train Loss: {train_metrics['total_loss']:.4f}")
-        
-        # Validate if validation loader is available
+        if val_len > 0
+        else None
+    )
+
+    for epoch in range(start_epoch, args.epochs):
+        train_metrics = train_one_epoch(
+            model=model,
+            dataloader=train_loader,
+            criterion=criterion,
+            optimizer=optimizer,
+            scaler=scaler,
+            device=device,
+            epoch=epoch,
+            use_amp=(args.use_amp and device.type == "cuda"),
+            ema=ema,
+        )
+
+        current_loss = train_metrics["total_loss"]
         if val_loader is not None:
-            val_metrics = validate(model, val_loader, criterion, device, epoch)
-            print(f"Val Loss: {val_metrics['total_loss']:.4f}")
-            current_loss = val_metrics['total_loss']
-        else:
-            current_loss = train_metrics['total_loss']
-        
-        # Update learning rate
+            eval_model = ema.shadow_model if (ema is not None and hasattr(ema, "shadow_model")) else model
+            val_metrics = evaluate(eval_model, val_loader, criterion, device, epoch)
+            current_loss = val_metrics["total_loss"]
+
         scheduler.step()
-        
-        # Save checkpoints
+
         is_best = current_loss < best_loss
         if is_best:
             best_loss = current_loss
-        
-        # Save last checkpoint
+
         save_checkpoint(
-            model, optimizer, epoch, current_loss,
-            checkpoint_dir / 'last.pt', ema, scheduler
+            model=model,
+            optimizer=optimizer,
+            epoch=epoch,
+            loss=current_loss,
+            filepath=str(checkpoint_dir / "last.pt"),
+            ema_model=ema,
+            scheduler=scheduler,
         )
-        
-        # Save best model
+
         if is_best:
             save_checkpoint(
-                model, optimizer, epoch, current_loss,
-                checkpoint_dir / 'best_model.pt', ema, scheduler
+                model=model,
+                optimizer=optimizer,
+                epoch=epoch,
+                loss=current_loss,
+                filepath=str(checkpoint_dir / "best_model.pt"),
+                ema_model=ema,
+                scheduler=scheduler,
             )
-        
-        # Save periodic checkpoint
+
         if (epoch + 1) % args.save_interval == 0:
             save_checkpoint(
-                model, optimizer, epoch, current_loss,
-                checkpoint_dir / f'checkpoint_epoch_{epoch + 1}.pt', ema, scheduler
+                model=model,
+                optimizer=optimizer,
+                epoch=epoch,
+                loss=current_loss,
+                filepath=str(checkpoint_dir / f"checkpoint_epoch_{epoch + 1}.pt"),
+                ema_model=ema,
+                scheduler=scheduler,
             )
-    
-    print("\nTraining completed!")
-    print(f"Best loss: {best_loss:.4f}")
 
 
 if __name__ == "__main__":

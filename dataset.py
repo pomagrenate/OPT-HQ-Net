@@ -1,19 +1,14 @@
-"""
-Dataset module for loading MAGFiLO data.
-
-Supports loading H-alpha solar images and their corresponding filament masks
-from the MAGFiLO_1.0_Kaggle_2026 dataset structure.
-"""
-
 from __future__ import annotations
-import os
+
 import json
-import numpy as np
 from pathlib import Path
-from typing import Optional, Tuple, List
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+import cv2
+import numpy as np
 import torch
-from torch.utils.data import Dataset
 from PIL import Image
+from torch.utils.data import DataLoader, Dataset
 
 try:
     from astropy.io import fits
@@ -21,402 +16,311 @@ try:
 except ImportError:
     _HAS_ASTROPY = False
 
-from preprocessing import preprocess_observation, extract_tiles, class_balanced_sample
+from preprocessing import (
+    class_balanced_sample,
+    continuity_safe_augment,
+    extract_tiles,
+)
 
 
 class SolarFilamentDataset(Dataset):
-    """
-    Dataset for loading MAGFiLO solar filament data.
-    
-    Expected directory structure:
-    data_root/
-    ├── train_images/      # H-alpha JPEG files (training)
-    ├── test_images/       # H-alpha JPEG files (testing)
-    └── MAGFiLO_1.0_Annotations_kaggle2026_train.json  # Training annotations
-    """
-    
-    def __init__(self, data_root: str, split: str = 'train', 
-                 tile_size: int = 256, overlap: float = 0.25,
-                 use_cache: bool = True, transform=None):
-        """
-        Args:
-            data_root: Path to the dataset root directory
-            split: 'train' or 'test'
-            tile_size: Size of tiles for training
-            overlap: Overlap fraction for tiling
-            use_cache: Whether to use cached .npy files if available
-            transform: Optional transform function
-        """
+    SUPPORTED_EXTENSIONS = ('.npy', '.fits', '.fit', '.jpeg', '.jpg', '.png')
+
+    def __init__(
+        self,
+        data_root: str | Path,
+        split: str = 'train',
+        tile_size: int = 256,
+        overlap: float = 0.25,
+        use_cache: bool = True,
+        use_mmap: bool = True,
+        augment: bool = False,
+        transform: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
+    ) -> None:
+        super().__init__()
         self.data_root = Path(data_root)
-        self.split = split
+        self.split = split.lower()
         self.tile_size = tile_size
         self.overlap = overlap
         self.use_cache = use_cache
+        self.use_mmap = use_mmap
+        self.augment = augment and (self.split == 'train')
         self.transform = transform
-        
-        # Determine image directory based on split
-        # Handle both directory structures:
-        # 1. data_root/train/train_images (MAGFiLO structure)
-        # 2. data_root/train_images (flat structure)
-        if split == 'train':
-            # Try MAGFiLO structure first
-            possible_dirs = [
-                self.data_root / "train" / "train_images",
-                self.data_root / "train_images",
-                self.data_root / "train"
-            ]
-            
-            for possible_dir in possible_dirs:
-                if possible_dir.exists():
-                    self.image_dir = possible_dir
-                    break
-            else:
-                raise ValueError(f"Image directory not found in any of: {possible_dirs}")
-            
-            # Try to find annotations file
-            possible_annotations = [
-                self.data_root / "train" / "MAGFiLO_1.0_Annotations_kaggle2026_train.json",
-                self.data_root / "MAGFiLO_1.0_Annotations_kaggle2026_train.json",
-                self.data_root / "annotations.json"
-            ]
-            
-            for possible_file in possible_annotations:
-                if possible_file.exists():
-                    self.annotations_file = possible_file
-                    break
-            else:
-                self.annotations_file = None
-                print("Warning: No annotations file found")
-        else:
-            # Test split
-            possible_dirs = [
-                self.data_root / "test" / "test_images",
-                self.data_root / "test_images",
-                self.data_root / "test"
-            ]
-            
-            for possible_dir in possible_dirs:
-                if possible_dir.exists():
-                    self.image_dir = possible_dir
-                    break
-            else:
-                raise ValueError(f"Image directory not found in any of: {possible_dirs}")
-            
-            self.annotations_file = None
-        
-        # Check if using cached .npy format
-        if self.use_cache and self.image_dir.exists():
-            npy_files = list(self.image_dir.glob("*.npy"))
+
+        self.image_dir = self._resolve_image_dir()
+        self.image_files = self._collect_image_files()
+        if not self.image_files:
+            raise FileNotFoundError(f"No valid image files found in {self.image_dir}")
+
+        self.img_to_polygons: Dict[str, List[List[float]]] = {}
+        self.img_dimensions: Dict[str, Tuple[int, int]] = {}
+        if self.split == 'train':
+            self._load_and_index_annotations()
+
+    def _resolve_image_dir(self) -> Path:
+        sub = "train" if self.split == "train" else "test"
+        candidate_paths = [
+            self.data_root / sub / f"{sub}_images",
+            self.data_root / f"{sub}_images",
+            self.data_root / sub,
+            self.data_root,
+        ]
+        for path in candidate_paths:
+            if path.is_dir():
+                return path
+        raise FileNotFoundError(
+            f"Could not locate image directory for split '{self.split}'. Checked: {candidate_paths}"
+        )
+
+    def _collect_image_files(self) -> List[Path]:
+        if self.use_cache:
+            npy_files = sorted(list(self.image_dir.glob("*.npy")))
             if npy_files:
-                self.use_npy_cache = True
-                self.image_files = sorted(npy_files)
-                print(f"Using cached .npy format: {len(self.image_files)} images")
-            else:
-                self.use_npy_cache = False
+                return npy_files
+
+        files: List[Path] = []
+        for ext in self.SUPPORTED_EXTENSIONS:
+            if ext == '.npy':
+                continue
+            files.extend(self.image_dir.glob(f"*{ext}"))
+            files.extend(self.image_dir.glob(f"*{ext.upper()}"))
+        return sorted(files)
+
+    def _load_and_index_annotations(self) -> None:
+        candidate_files = [
+            self.data_root / "train" / "MAGFiLO_1.0_Annotations_kaggle2026_train.json",
+            self.data_root / "MAGFiLO_1.0_Annotations_kaggle2026_train.json",
+            self.data_root / "train" / "annotations.json",
+            self.data_root / "annotations.json",
+        ]
+        ann_path = next((p for p in candidate_files if p.is_file()), None)
+
+        if ann_path is None:
+            return
+
+        with open(ann_path, "r", encoding="utf-8") as f:
+            coco_payload = json.load(f)
+
+        id_to_filename: Dict[int, str] = {}
+        for img_info in coco_payload.get("images", []):
+            img_id = img_info["id"]
+            fname = img_info["file_name"]
+            id_to_filename[img_id] = fname
+            self.img_dimensions[fname] = (
+                img_info.get("height", 2048),
+                img_info.get("width", 2048),
+            )
+
+        for ann in coco_payload.get("annotations", []):
+            img_id = ann.get("image_id")
+            if img_id not in id_to_filename:
+                continue
+
+            fname = id_to_filename[img_id]
+            if fname not in self.img_to_polygons:
+                self.img_to_polygons[fname] = []
+
+            segmentation = ann.get("segmentation", [])
+            if isinstance(segmentation, list):
+                self.img_to_polygons[fname].extend(segmentation)
+
+    def _read_image(self, path: Path) -> np.ndarray:
+        ext = path.suffix.lower()
+
+        if ext == '.npy':
+            mmap = 'r' if self.use_mmap else None
+            arr = np.load(path, mmap_mode=mmap)
+            return np.array(arr, dtype=np.float32, copy=False)
+
+        if ext in ('.fits', '.fit'):
+            if not _HAS_ASTROPY:
+                raise ImportError("astropy library is required to read FITS files.")
+            with fits.open(path) as hdul:
+                arr = hdul[0].data.astype(np.float32)
         else:
-            self.use_npy_cache = False
-            
-        if not self.use_npy_cache:
-            # Look for image files
-            if not self.image_dir.exists():
-                raise ValueError(f"Image directory not found: {self.image_dir}")
-            
-            # Get all image files (support JPEG, PNG, FITS)
-            image_extensions = ['.jpeg', '.jpg', '.png', '.fits', '.fit']
-            self.image_files = []
-            for ext in image_extensions:
-                self.image_files.extend(self.image_dir.glob(f"*{ext}"))
-            
-            self.image_files = sorted(self.image_files)
-            
-            # Load annotations for training
-            self.annotations = None
-            if split == 'train' and self.annotations_file.exists():
-                import json
-                with open(self.annotations_file, 'r') as f:
-                    self.annotations = json.load(f)
-                print(f"Loaded annotations with {len(self.annotations.get('annotations', []))} entries")
-        
-        print(f"Loaded {len(self.image_files)} images for {split} split")
-        
+            with Image.open(path) as img:
+                arr = np.array(img.convert('L'), dtype=np.float32)
+
+        max_val = arr.max()
+        if max_val > 1.0:
+            arr /= 255.0 if max_val <= 255.0 else max_val
+
+        return arr
+
+    def _generate_mask(self, file_name: str, fallback_shape: Tuple[int, int]) -> Optional[np.ndarray]:
+        polygons = self.img_to_polygons.get(file_name)
+        if polygons is None:
+            polygons = next(
+                (v for k, v in self.img_to_polygons.items() if Path(k).stem == Path(file_name).stem),
+                None,
+            )
+
+        if not polygons:
+            return None
+
+        h, w = self.img_dimensions.get(file_name, fallback_shape)
+        mask = np.zeros((h, w), dtype=np.uint8)
+
+        for poly in polygons:
+            pts = np.array(poly, dtype=np.int32).reshape(-1, 1, 2)
+            cv2.fillPoly(mask, [pts], color=1)
+
+        return mask.astype(np.float32)
+
+    def _compute_ridge_prior(self, img_01: np.ndarray) -> np.ndarray:
+        u8_img = (np.clip(img_01, 0.0, 1.0) * 255.0).astype(np.uint8)
+        grad_x = cv2.Sobel(u8_img, cv2.CV_32F, 1, 0, ksize=3)
+        grad_y = cv2.Sobel(u8_img, cv2.CV_32F, 0, 1, ksize=3)
+        magnitude = cv2.magnitude(grad_x, grad_y)
+        max_val = magnitude.max()
+        if max_val > 1e-6:
+            magnitude /= max_val
+        return magnitude
+
     def __len__(self) -> int:
         return len(self.image_files)
-    
-    def load_image(self, image_path: Path) -> np.ndarray:
-        """Load an image from file (supports FITS, PNG, NPY)."""
-        if image_path.suffix.lower() in ['.fits', '.fit']:
-            if not _HAS_ASTROPY:
-                raise ImportError("astropy is required to load FITS files")
-            with fits.open(image_path) as hdul:
-                data = hdul[0].data.astype(np.float32)
-        elif image_path.suffix.lower() == '.npy':
-            data = np.load(image_path).astype(np.float32)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        img_path = self.image_files[idx]
+        raw_arr = self._read_image(img_path)
+
+        if raw_arr.ndim == 3 and raw_arr.shape[0] == 2:
+            image_stack = raw_arr
+            h, w = image_stack.shape[1], image_stack.shape[2]
+        elif raw_arr.ndim == 2:
+            h, w = raw_arr.shape
+            lo, hi = np.percentile(raw_arr, [1.0, 99.0])
+            norm_img = np.clip((raw_arr - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
+            ridge = self._compute_ridge_prior(norm_img)
+            image_stack = np.stack([norm_img, ridge], axis=0).astype(np.float32)
         else:
-            # Assume standard image format
-            img = Image.open(image_path).convert('L')
-            data = np.array(img, dtype=np.float32)
-            
-        return data
-    
-    def load_mask_from_annotations(self, image_name: str) -> Optional[np.ndarray]:
-        """Load mask from COCO-format JSON annotations based on image name (optimized)."""
-        if self.annotations is None:
-            return None
-        
-        # Check cache first
-        cache_key = f"{image_name}_mask"
-        if hasattr(self, '_mask_cache') and cache_key in self._mask_cache:
-            return self._mask_cache[cache_key]
-        
-        # Initialize cache if not exists
-        if not hasattr(self, '_mask_cache'):
-            self._mask_cache = {}
-        
-        # Find the image ID for this image
-        image_id = None
-        for img_info in self.annotations.get('images', []):
-            if img_info.get('file_name') == image_name:
-                image_id = img_info.get('id')
-                break
-        
-        if image_id is None:
-            return None
-        
-        # Find all annotations for this image
-        annotations = []
-        for annotation in self.annotations.get('annotations', []):
-            if annotation.get('image_id') == image_id:
-                annotations.append(annotation)
-        
-        if not annotations:
-            self._mask_cache[cache_key] = None
-            return None
-        
-        # Create a binary mask from polygon annotations
-        # Get image dimensions
-        img_info = next((img for img in self.annotations.get('images', []) if img.get('id') == image_id), None)
-        if img_info is None:
-            return None
-        
-        height = img_info.get('height', 2048)
-        width = img_info.get('width', 2048)
-        
-        # Create empty mask
-        mask = np.zeros((height, width), dtype=np.float32)
-        
-        # Fill mask with polygons - optimized using OpenCV
-        try:
-            import cv2
-            for annotation in annotations:
-                if 'segmentation' in annotation:
-                    polygons = annotation['segmentation']
-                    for polygon in polygons:
-                        # Reshape polygon to (N, 1, 2) for OpenCV
-                        poly_points = np.array(polygon, dtype=np.int32).reshape(-1, 1, 2)
-                        # Fill polygon directly on numpy array (much faster than PIL)
-                        cv2.fillPoly(mask, [poly_points], 1)
-        except Exception as e:
-            print(f"Warning: Could not load mask for {image_name}: {e}")
-            self._mask_cache[cache_key] = None
-            return None
-        
-        # Cache the result
-        self._mask_cache[cache_key] = mask
-        
-        return mask
-    
-    def __getitem__(self, idx: int) -> dict:
-        image_path = self.image_files[idx]
-        
-        # Load image
-        if self.use_npy_cache:
-            image_data = np.load(image_path).astype(np.float32)
-        else:
-            image_data = self.load_image(image_path)
-        
-        # Load mask if available (training mode)
-        mask_data = None
+            raise ValueError(f"Unexpected image shape {raw_arr.shape} at {img_path}")
+
+        valid_mask = np.ones((1, h, w), dtype=np.float32)
+
         if self.split == 'train':
-            mask_data = self.load_mask_from_annotations(image_path.name)
-        
-        # Simplified preprocessing for speed (skip full preprocessing for now)
-        # Just normalize and stack with a simple ridge prior
-        img = image_data.astype(np.float32)
-        if img.max() > 1.0:
-            img = img / 255.0
-        
-        # Simple normalization
-        lo, hi = np.percentile(img, [1, 99])
-        img = np.clip((img - lo) / max(hi - lo, 1e-6), 0, 1)
-        
-        # Simple ridge prior (gradient magnitude)
-        import cv2
-        gray = (img * 255).astype(np.uint8)
-        grad_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
-        grad_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
-        ridge = np.sqrt(grad_x**2 + grad_y**2)
-        ridge = ridge / (ridge.max() + 1e-6)
-        
-        # Stack
-        stack = np.stack([img, ridge], axis=0).astype(np.float32)
-        
-        # Simple valid mask (all pixels valid for now)
-        valid_mask = np.ones((1, img.shape[0], img.shape[1]), dtype=np.float32)
-        
-        processed = type('obj', (object,), {
-            'image': stack,
-            'valid_mask': valid_mask,
-            'disk': (img.shape[1]//2, img.shape[0]//2, min(img.shape)//2)
-        })()
-        
-        # Extract tiles for training
-        if mask_data is not None:
+            gt_mask = self._generate_mask(img_path.name, fallback_shape=(h, w))
+            if gt_mask is None:
+                gt_mask = np.zeros((h, w), dtype=np.float32)
+
             tiles = extract_tiles(
-                processed.image, 
-                processed.valid_mask, 
-                mask_data,
+                image_stack,
+                valid_mask,
+                gt_mask,
                 tile=self.tile_size,
-                overlap=self.overlap
+                overlap=self.overlap,
             )
-            
-            # Class-balanced sampling
-            sampled_tiles = class_balanced_sample(tiles, n=1)
-            if sampled_tiles:
-                img_tile, valid_tile, gt_tile, has_fil, (y, x) = sampled_tiles[0]
-                
-                sample = {
-                    'image': torch.from_numpy(img_tile).float(),
-                    'valid_mask': torch.from_numpy(valid_tile).float(),
-                    'mask': torch.from_numpy(gt_tile).float().unsqueeze(0),  # Add channel dimension
-                    'has_filament': has_fil,
-                    'tile_coords': (y, x),
-                    'image_id': image_path.stem
-                }
+            sampled = class_balanced_sample(tiles, positive_ratio=0.7, n=1)
+
+            if sampled:
+                img_tile, valid_tile, gt_tile, has_fil, (ty, tx) = sampled[0]
             else:
-                # Fallback if no valid tiles - create a zero mask with proper shape
-                sample = {
-                    'image': torch.from_numpy(processed.image).float(),
-                    'valid_mask': torch.from_numpy(processed.valid_mask).float(),
-                    'mask': torch.zeros(1, *processed.valid_mask.shape).float(),  # Add channel dimension
-                    'has_filament': False,
-                    'tile_coords': (0, 0),
-                    'image_id': image_path.stem
-                }
-        else:
-            # Inference mode - return full image
-            sample = {
-                'image': torch.from_numpy(processed.image).float(),
-                'valid_mask': torch.from_numpy(processed.valid_mask).float(),
-                'mask': None,
-                'image_id': image_path.stem,
-                'disk': processed.disk
+                img_tile = image_stack[:, :self.tile_size, :self.tile_size]
+                valid_tile = valid_mask[:, :self.tile_size, :self.tile_size]
+                gt_tile = gt_mask[:self.tile_size, :self.tile_size]
+                has_fil = bool(gt_tile.sum() > 0)
+                ty, tx = 0, 0
+
+            if self.augment:
+                img_tile, gt_tile, valid_tile = continuity_safe_augment(
+                    img_tile, gt_tile, valid_tile
+                )
+
+            sample: Dict[str, Any] = {
+                'image': torch.from_numpy(np.ascontiguousarray(img_tile)).float(),
+                'valid_mask': torch.from_numpy(np.ascontiguousarray(valid_tile)).float(),
+                'mask': torch.from_numpy(np.ascontiguousarray(gt_tile)).float().unsqueeze(0),
+                'has_filament': has_fil,
+                'tile_coords': torch.tensor([ty, tx], dtype=torch.long),
+                'image_id': img_path.stem,
             }
-        
-        if self.transform:
+        else:
+            disk_meta = (w // 2, h // 2, min(h, w) // 2)
+            sample = {
+                'image': torch.from_numpy(np.ascontiguousarray(image_stack)).float(),
+                'valid_mask': torch.from_numpy(np.ascontiguousarray(valid_mask)).float(),
+                'mask': None,
+                'image_id': img_path.stem,
+                'disk': disk_meta,
+            }
+
+        if self.transform is not None:
             sample = self.transform(sample)
-            
+
         return sample
 
 
-def create_dataloaders(data_root: str, batch_size: int = 4, 
-                      tile_size: int = 256, num_workers: int = 0,
-                      use_cache: bool = True, val_split: float = 0.1) -> Tuple[torch.utils.data.DataLoader, 
-                                                                                Optional[torch.utils.data.DataLoader]]:
-    """
-    Create train and validation dataloaders.
-    
-    Args:
-        data_root: Path to the dataset root directory
-        batch_size: Batch size for training
-        tile_size: Size of tiles for training
-        num_workers: Number of worker processes for data loading (use 0 for DDP stability)
-        use_cache: Whether to use cached .npy files
-        val_split: Fraction of data to use for validation
-        
-    Returns:
-        train_loader, val_loader
-    """
+def solar_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not batch:
+        return {}
+
+    has_mask = batch[0].get('mask') is not None
+
+    if has_mask:
+        return {
+            'image': torch.stack([b['image'] for b in batch], dim=0),
+            'valid_mask': torch.stack([b['valid_mask'] for b in batch], dim=0),
+            'mask': torch.stack([b['mask'] for b in batch], dim=0),
+            'has_filament': torch.tensor([b['has_filament'] for b in batch], dtype=torch.bool),
+            'tile_coords': torch.stack([b['tile_coords'] for b in batch], dim=0),
+            'image_id': [b['image_id'] for b in batch],
+        }
+
+    return {
+        'image': [b['image'] for b in batch],
+        'valid_mask': [b['valid_mask'] for b in batch],
+        'image_id': [b['image_id'] for b in batch],
+        'disk': [b.get('disk') for b in batch],
+    }
+
+
+def create_dataloaders(
+    data_root: str | Path,
+    batch_size: int = 8,
+    tile_size: int = 256,
+    overlap: float = 0.25,
+    val_split: float = 0.1,
+    num_workers: int = 4,
+    use_cache: bool = True,
+    seed: int = 42,
+) -> Tuple[DataLoader, Optional[DataLoader]]:
     full_dataset = SolarFilamentDataset(
         data_root=data_root,
         split='train',
         tile_size=tile_size,
-        use_cache=use_cache
+        overlap=overlap,
+        use_cache=use_cache,
+        augment=True,
     )
-    
-    # Split into train and validation
-    dataset_size = len(full_dataset)
-    val_size = int(dataset_size * val_split)
-    train_size = dataset_size - val_size
-    
-    train_dataset, val_dataset = torch.utils.data.random_split(
-        full_dataset, [train_size, val_size],
-        generator=torch.Generator().manual_seed(42)
+
+    total_samples = len(full_dataset)
+    val_size = int(total_samples * val_split)
+    train_size = total_samples - val_size
+
+    train_ds, val_ds = torch.utils.data.random_split(
+        full_dataset,
+        [train_size, val_size],
+        generator=torch.Generator().manual_seed(seed),
     )
-    
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset,
+
+    train_loader = DataLoader(
+        train_ds,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
-        pin_memory=True,
-        collate_fn=collate_fn
+        pin_memory=torch.cuda.is_available(),
+        collate_fn=solar_collate_fn,
+        drop_last=True,
     )
-    
-    val_loader = torch.utils.data.DataLoader(
-        val_dataset,
+
+    val_loader = DataLoader(
+        val_ds,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=True,
-        collate_fn=collate_fn
-    )
-    
-    print(f"Train samples: {train_size}, Val samples: {val_size}")
-    
+        pin_memory=torch.cuda.is_available(),
+        collate_fn=solar_collate_fn,
+        drop_last=False,
+    ) if val_size > 0 else None
+
     return train_loader, val_loader
-
-
-def collate_fn(batch: List[dict]) -> dict:
-    """Custom collate function for batching variable-sized samples."""
-    if len(batch) == 0:
-        return {}
-    
-    # Check if this is training mode (has masks) or inference mode
-    has_masks = batch[0].get('mask') is not None
-    
-    if has_masks:
-        images = torch.stack([item['image'] for item in batch])
-        valid_masks = torch.stack([item['valid_mask'] for item in batch])
-        masks = torch.stack([item['mask'] for item in batch])
-        
-        return {
-            'image': images,
-            'valid_mask': valid_masks,
-            'mask': masks,
-            'image_ids': [item['image_id'] for item in batch]
-        }
-    else:
-        # Inference mode - batch might have different sizes
-        return {
-            'image': [item['image'] for item in batch],
-            'valid_mask': [item['valid_mask'] for item in batch],
-            'image_ids': [item['image_id'] for item in batch],
-            'disk': [item.get('disk') for item in batch]
-        }
-
-
-if __name__ == "__main__":
-    # Test the dataset
-    print("Testing SolarFilamentDataset...")
-    
-    # You can test with your actual data path
-    # data_root = "path/to/MAGFiLO_1.0_Kaggle_2026/train"
-    # dataset = SolarFilamentDataset(data_root, split='train')
-    # print(f"Dataset size: {len(dataset)}")
-    # sample = dataset[0]
-    # print(f"Sample keys: {sample.keys()}")
-    # print(f"Image shape: {sample['image'].shape}")
-    # if sample['mask'] is not None:
-    #     print(f"Mask shape: {sample['mask'].shape}")
-    
-    print("Dataset module loaded successfully!")
