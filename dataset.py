@@ -19,7 +19,10 @@ try:
 except ImportError:
     _HAS_ASTROPY = False
 
-from preprocessing import continuity_safe_augment
+from preprocessing import (
+    continuity_safe_augment,
+    process_solar_observation,
+)
 
 
 class SolarFilamentDataset(Dataset):
@@ -167,16 +170,6 @@ class SolarFilamentDataset(Dataset):
 
         return mask.astype(np.float32)
 
-    def _compute_ridge_prior(self, img_01: np.ndarray) -> np.ndarray:
-        u8_img = (np.clip(img_01, 0.0, 1.0) * 255.0).astype(np.uint8)
-        grad_x = cv2.Sobel(u8_img, cv2.CV_32F, 1, 0, ksize=3)
-        grad_y = cv2.Sobel(u8_img, cv2.CV_32F, 0, 1, ksize=3)
-        magnitude = cv2.magnitude(grad_x, grad_y)
-        max_val = magnitude.max()
-        if max_val > 1e-6:
-            magnitude /= max_val
-        return magnitude
-
     def __len__(self) -> int:
         return len(self.image_files)
 
@@ -189,15 +182,12 @@ class SolarFilamentDataset(Dataset):
             h, w = image_stack.shape[1], image_stack.shape[2]
         elif raw_arr.ndim == 2:
             h, w = raw_arr.shape
-            lo, hi = np.percentile(raw_arr, [1.0, 99.0])
-            norm_img = np.clip((raw_arr - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
-            ridge = self._compute_ridge_prior(norm_img)
-            image_stack = np.stack([norm_img, ridge], axis=0).astype(np.float32)
+            image_stack = process_solar_observation(raw_arr)
         else:
             raise ValueError(f"Unexpected image shape {raw_arr.shape} at {img_path}")
 
         cx, cy = w // 2, h // 2
-        r_sun = int(0.45 * min(h, w))
+        r_sun = int(0.46 * min(h, w))
 
         global_img = cv2.resize(image_stack[0], (self.global_size, self.global_size), interpolation=cv2.INTER_AREA)
         global_ridge = cv2.resize(image_stack[1], (self.global_size, self.global_size), interpolation=cv2.INTER_AREA)
@@ -211,7 +201,7 @@ class SolarFilamentDataset(Dataset):
                 gt_mask = np.zeros((h, w), dtype=np.float32)
 
             polygons = self.img_to_polygons.get(img_path.name, [])
-            sample_positive = (len(polygons) > 0) and (np.random.rand() < 0.7)
+            sample_positive = (len(polygons) > 0) and (np.random.rand() < 0.75)
 
             if sample_positive and len(polygons) > 0:
                 chosen_poly = polygons[np.random.randint(len(polygons))]
@@ -299,3 +289,55 @@ def solar_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         'image_id': [b['image_id'] for b in batch],
         'disk': [b.get('disk') for b in batch],
     }
+
+
+def create_dataloaders(
+    data_root: str | Path,
+    batch_size: int = 4,
+    tile_size: int = 512,
+    overlap: float = 0.25,
+    val_split: float = 0.1,
+    num_workers: int = 2,
+    use_cache: bool = True,
+    seed: int = 42,
+) -> Tuple[DataLoader, Optional[DataLoader]]:
+    full_dataset = SolarFilamentDataset(
+        data_root=data_root,
+        split='train',
+        tile_size=tile_size,
+        overlap=overlap,
+        use_cache=use_cache,
+        augment=True,
+    )
+
+    total_samples = len(full_dataset)
+    val_size = int(total_samples * val_split)
+    train_size = total_samples - val_size
+
+    train_ds, val_ds = torch.utils.data.random_split(
+        full_dataset,
+        [train_size, val_size],
+        generator=torch.Generator().manual_seed(seed),
+    )
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+        collate_fn=solar_collate_fn,
+        drop_last=True,
+    )
+
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+        collate_fn=solar_collate_fn,
+        drop_last=False,
+    ) if val_size > 0 else None
+
+    return train_loader, val_loader

@@ -20,6 +20,7 @@ from dataset import SolarFilamentDataset, solar_collate_fn
 from inference import postprocess_mask, tiled_predict
 from losses import MicroFilNetLoss
 from model import MicroFilNet
+from preprocessing import process_solar_observation
 from utils import (
     ModelEMA,
     binary_mask_to_rle,
@@ -106,14 +107,12 @@ def save_full_disk_validation_plot(
     if raw_img.ndim == 3 and raw_img.shape[0] == 2:
         image_stack = raw_img
     else:
-        lo, hi = np.percentile(raw_img, [1.0, 99.0])
-        norm_img = np.clip((raw_img - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
-        ridge = underlying_dataset._compute_ridge_prior(norm_img)
-        image_stack = np.stack([norm_img, ridge], axis=0).astype(np.float32)
+        image_stack = process_solar_observation(raw_img)
 
     h, w = image_stack.shape[1], image_stack.shape[2]
+    cx, cy = w // 2, h // 2
+    r_sun = int(0.46 * min(h, w))
     valid_mask = np.ones((1, h, w), dtype=np.float32)
-    cx, cy, r_sun = w // 2, h // 2, int(0.45 * min(h, w))
 
     global_img = cv2.resize(image_stack[0], (512, 512), interpolation=cv2.INTER_AREA)
     global_ridge = cv2.resize(image_stack[1], (512, 512), interpolation=cv2.INTER_AREA)
@@ -137,8 +136,8 @@ def save_full_disk_validation_plot(
         gt_mask = np.zeros((h, w), dtype=np.float32)
 
     fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-    axes[0].imshow(image_stack[0], cmap="gray")
-    axes[0].set_title(f"H-alpha Full Disk ({h}x{w})")
+    axes[0].imshow(image_stack[0], cmap="magma")
+    axes[0].set_title(f"Processed Inverted H-alpha ({h}x{w})")
     axes[0].axis("off")
 
     axes[1].imshow(gt_mask, cmap="gray")

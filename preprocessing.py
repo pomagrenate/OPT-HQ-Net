@@ -1,96 +1,39 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import cv2
 import numpy as np
 
-try:
-    from skimage.filters import frangi
-    from skimage.morphology import black_tophat, disk as skimage_disk
-    _HAS_SKIMAGE = True
-except ImportError:
-    _HAS_SKIMAGE = False
-
-
-# NOTE: preprocess_observation() below (radial_flatten + CLAHE + frangi/
-# black-tophat ridge prior) is the strongest preprocessing you have, but
-# nothing currently calls it as part of the training/inference path.
-# dataset.py._read_image / __getitem__ instead do a cheaper on-the-fly
-# percentile-clip + Sobel-gradient ridge, which is weaker (no limb/radial
-# flattening, no CLAHE, no vesselness). If your cached .npy files were built
-# by calling preprocess_observation() offline, that's a real train/inference
-# mismatch vs. any raw-image fallback path. Either (a) write an offline
-# caching script that calls preprocess_observation() to produce the .npy
-# files dataset.py prefers when use_cache=True, or (b) call it directly
-# inside SolarFilamentDataset._read_image for non-.npy inputs so both paths
-# see the same features.
-def load_fits_as_array(path: str) -> np.ndarray:
-    from astropy.io import fits
-    with fits.open(path) as hdul:
-        data = hdul[0].data.astype(np.float32)
-    return data
+cv2.setNumThreads(0)
+cv2.ocl.setUseOpenCL(False)
 
 
 def normalize_01(img: np.ndarray) -> np.ndarray:
-    lo, hi = np.percentile(img, [0.5, 99.5])
+    lo, hi = np.percentile(img, [1.0, 99.0])
     denom = max(float(hi - lo), 1e-6)
     return np.clip((img - lo) / denom, 0.0, 1.0).astype(np.float32)
 
 
-def detect_solar_disk(img_u8: np.ndarray) -> tuple[int, int, int]:
-    h, w = img_u8.shape
-    blurred = cv2.GaussianBlur(img_u8, (9, 9), 2)
-    circles = cv2.HoughCircles(
-        blurred,
-        cv2.HOUGH_GRADIENT,
-        dp=1.5,
-        minDist=float(w),
-        param1=50,
-        param2=30,
-        minRadius=int(0.35 * min(h, w)),
-        maxRadius=int(0.5 * min(h, w)),
-    )
-    if circles is not None:
-        cx, cy, r = circles[0, 0]
-        return int(round(cx)), int(round(cy)), int(round(r))
-    return w // 2, h // 2, int(0.45 * min(h, w))
-
-
-def make_disk_mask(
-    shape: tuple[int, int],
-    cx: int,
-    cy: int,
-    r: int,
-    shrink_px: int = 2,
-) -> np.ndarray:
-    yy, xx = np.ogrid[:shape[0], :shape[1]]
-    dist2 = (xx - cx) ** 2 + (yy - cy) ** 2
-    return (dist2 <= (max(r - shrink_px, 0)) ** 2).astype(np.float32)
-
-
-def radial_flatten(
+def fast_radial_flatten(
     img: np.ndarray,
-    mask: np.ndarray,
     cx: int,
     cy: int,
     r: int,
-    n_bins: int = 200,
+    n_bins: int = 128,
 ) -> np.ndarray:
     h, w = img.shape
     yy, xx = np.ogrid[:h, :w]
     rr = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2) / max(float(r), 1.0)
     bin_idx = np.clip((rr * n_bins).astype(np.int32), 0, n_bins - 1)
 
-    valid = mask > 0.5
-    valid_bins = bin_idx[valid]
-    valid_pixels = img[valid]
+    disk_mask = rr <= 1.0
+    valid_bins = bin_idx[disk_mask]
+    valid_pixels = img[disk_mask]
 
-    if len(valid_pixels) == 0:
+    if valid_pixels.size == 0:
         return normalize_01(img)
 
     counts = np.bincount(valid_bins, minlength=n_bins)
     sums = np.bincount(valid_bins, weights=valid_pixels, minlength=n_bins)
-
     profile = np.zeros(n_bins, dtype=np.float32)
     nonzero = counts > 0
     profile[nonzero] = sums[nonzero] / counts[nonzero]
@@ -103,154 +46,48 @@ def radial_flatten(
         if counts[b] == 0 and profile[b] == 0.0:
             profile[b] = profile[b + 1]
 
-    k = max(3, (n_bins // 40) | 1)
-    profile_smooth = cv2.blur(profile.reshape(1, -1), (k, 1)).flatten()
+    profile_smooth = cv2.blur(profile.reshape(1, -1), (9, 1)).flatten()
     profile_smooth = np.clip(profile_smooth, 1e-3, None)
 
     background_2d = profile_smooth[bin_idx]
     flattened = img / background_2d
-    median_val = float(np.median(valid_pixels)) if valid_pixels.size > 0 else 1.0
-    flattened *= median_val
-    flattened[~valid] = 0.0
+    flattened[~disk_mask] = 0.0
     return normalize_01(flattened)
 
 
-def denoise_and_enhance(
-    img: np.ndarray,
-    mask: np.ndarray,
-    clahe_clip: float = 2.5,
-    clahe_tile: int = 8,
-) -> np.ndarray:
-    blurred = cv2.GaussianBlur(img, (3, 3), sigmaX=0.7)
-    u8 = (np.clip(blurred, 0.0, 1.0) * 255.0).astype(np.uint8)
-    clahe = cv2.createCLAHE(clipLimit=clahe_clip, tileGridSize=(clahe_tile, clahe_tile))
+def enhance_dark_structures_and_edges(
+    img_flat: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    u8 = (np.clip(img_flat, 0.0, 1.0) * 255.0).astype(np.uint8)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
     enhanced = clahe.apply(u8).astype(np.float32) / 255.0
-    enhanced[mask < 0.5] = 0.0
-    return enhanced
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    closed = cv2.morphologyEx(u8, cv2.MORPH_CLOSE, kernel)
+    dark_tophat = np.clip(closed.astype(np.float32) - u8.astype(np.float32), 0.0, 255.0) / 255.0
+
+    grad_x = cv2.Sobel(u8, cv2.CV_32F, 1, 0, ksize=3)
+    grad_y = cv2.Sobel(u8, cv2.CV_32F, 0, 1, ksize=3)
+    edges = cv2.magnitude(grad_x, grad_y)
+    max_e = edges.max()
+    if max_e > 1e-6:
+        edges /= max_e
+
+    feature_channel = np.clip(1.0 - enhanced, 0.0, 1.0).astype(np.float32)
+    ridge_channel = np.clip(0.6 * dark_tophat + 0.4 * edges, 0.0, 1.0).astype(np.float32)
+
+    return feature_channel, ridge_channel
 
 
-def ridge_prior(img: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    inv = 1.0 - img
-    if _HAS_SKIMAGE:
-        u8 = (np.clip(img, 0.0, 1.0) * 255.0).astype(np.uint8)
-        th = black_tophat(u8, footprint=skimage_disk(9)).astype(np.float32) / 255.0
-        vess = frangi(inv, sigmas=range(1, 4), black_ridges=False)
-        vess = vess / (vess.max() + 1e-6)
-        prior = np.clip(0.5 * th + 0.5 * vess, 0.0, 1.0)
-    else:
-        u8 = (np.clip(img, 0.0, 1.0) * 255.0).astype(np.uint8)
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 17))
-        closed = cv2.morphologyEx(u8, cv2.MORPH_CLOSE, kernel)
-        th = np.clip(closed.astype(np.float32) - u8, 0.0, 255.0) / 255.0
-        prior = th
+def process_solar_observation(raw_img: np.ndarray) -> np.ndarray:
+    h, w = raw_img.shape[-2:]
+    cx, cy = w // 2, h // 2
+    r_sun = int(0.46 * min(h, w))
 
-    prior[mask < 0.5] = 0.0
-    return prior.astype(np.float32)
-
-
-@dataclass
-class PreprocessedObservation:
-    image: np.ndarray
-    valid_mask: np.ndarray
-    disk: tuple[int, int, int]
-
-
-def preprocess_observation(raw: np.ndarray) -> PreprocessedObservation:
-    img = normalize_01(raw)
-    u8 = (img * 255.0).astype(np.uint8)
-    cx, cy, r = detect_solar_disk(u8)
-    mask = make_disk_mask(img.shape, cx, cy, r)
-
-    flattened = radial_flatten(img, mask, cx, cy, r)
-    enhanced = denoise_and_enhance(flattened, mask)
-    prior = ridge_prior(enhanced, mask)
-
-    stack = np.stack([enhanced, prior], axis=0).astype(np.float32)
-    return PreprocessedObservation(
-        image=stack,
-        valid_mask=mask[None, ...].astype(np.float32),
-        disk=(cx, cy, r),
-    )
-
-
-def extract_tiles(
-    image: np.ndarray,
-    mask_valid: np.ndarray,
-    gt_mask: np.ndarray | None,
-    tile: int = 256,
-    overlap: float = 0.25,
-) -> list[tuple[np.ndarray, np.ndarray, np.ndarray | None, bool, tuple[int, int]]]:
-    c, h, w = image.shape
-    stride = max(1, int(tile * (1.0 - overlap)))
-    tiles = []
-
-    for y in range(0, h - tile + 1, stride):
-        for x in range(0, w - tile + 1, stride):
-            valid_t = mask_valid[:, y : y + tile, x : x + tile]
-            if valid_t.mean() < 0.05:
-                continue
-
-            img_t = image[:, y : y + tile, x : x + tile]
-            gt_t = None
-            has_fil = False
-
-            if gt_mask is not None:
-                gt_t = gt_mask[y : y + tile, x : x + tile]
-                has_fil = bool(gt_t.sum() > 0)
-
-            tiles.append((img_t, valid_t, gt_t, has_fil, (y, x)))
-
-    return tiles
-
-
-def class_balanced_sample(
-    tiles: list,
-    positive_ratio: float = 0.7,
-    n: int | None = None,
-    rng: np.random.Generator | None = None,
-) -> list:
-    """Sample `n` tiles, biased toward positives at `positive_ratio`.
-
-    NOTE: for small `n` (in particular the common `n=1` case used for
-    one-tile-per-__getitem__ sampling), `int(n * positive_ratio)` truncates
-    to 0 whenever `n * positive_ratio < 1`, which silently disables the
-    oversampling entirely. We draw `n_pos` from a Binomial(n, positive_ratio)
-    instead, so a single draw still resolves to "positive" with probability
-    `positive_ratio` on average, rather than deterministically to "negative".
-    """
-    rng = rng or np.random.default_rng()
-    pos = [t for t in tiles if t[3]]
-    neg = [t for t in tiles if not t[3]]
-    target_n = n or len(tiles)
-
-    if not pos and not neg:
-        return []
-    if not pos:
-        n_pos = 0
-    elif not neg:
-        n_pos = target_n
-    else:
-        n_pos = int(rng.binomial(target_n, positive_ratio))
-    n_neg = target_n - n_pos
-
-    if len(pos) == 0 or n_pos == 0:
-        pos_sample = []
-        n_neg = target_n
-    else:
-        replace_pos = len(pos) < n_pos
-        pos_indices = rng.choice(len(pos), size=n_pos, replace=replace_pos)
-        pos_sample = [pos[i] for i in pos_indices]
-
-    if len(neg) == 0 or n_neg == 0:
-        neg_sample = []
-    else:
-        replace_neg = len(neg) < n_neg
-        neg_indices = rng.choice(len(neg), size=n_neg, replace=replace_neg)
-        neg_sample = [neg[i] for i in neg_indices]
-
-    combined = pos_sample + neg_sample
-    rng.shuffle(combined)
-    return combined
+    norm = normalize_01(raw_img)
+    flattened = fast_radial_flatten(norm, cx, cy, r_sun)
+    feat, ridge = enhance_dark_structures_and_edges(flattened)
+    return np.stack([feat, ridge], axis=0).astype(np.float32)
 
 
 def continuity_safe_augment(
@@ -281,10 +118,6 @@ def continuity_safe_augment(
         img_out = img_out[..., ::-1, :].copy()
         gt_out = gt_out[..., ::-1, :].copy()
         valid_out = valid_out[..., ::-1, :].copy()
-
-    gain = float(rng.uniform(0.85, 1.15))
-    bias = float(rng.uniform(-0.05, 0.05))
-    img_out[0] = np.clip(img_out[0] * gain + bias, 0.0, 1.0)
 
     return (
         np.ascontiguousarray(img_out, dtype=np.float32),
