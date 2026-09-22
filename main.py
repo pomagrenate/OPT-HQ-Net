@@ -1,11 +1,19 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
-from dataset import SolarFilamentDataset
+from dataset import SolarFilamentDataset, solar_collate_fn
 from inference import tiled_predict
+from losses import MicroFilNetLoss
 from model import MicroFilNet
 from predict import postprocess_and_extract_components
 from train import evaluate, train_one_epoch
@@ -34,6 +42,7 @@ def parse_args():
     train_parser.add_argument("--use_amp", action="store_true")
     train_parser.add_argument("--num_workers", type=int, default=4)
     train_parser.add_argument("--checkpoint_dir", type=str, default="checkpoints")
+    train_parser.add_argument("--val_plot_dir", type=str, default=None)
     train_parser.add_argument("--resume", type=str, default=None)
     train_parser.add_argument("--save_interval", type=int, default=5)
     train_parser.add_argument("--device", type=str, default="cuda")
@@ -57,29 +66,74 @@ def parse_args():
     return parser.parse_args()
 
 
+def save_validation_plots(model: torch.nn.Module, val_loader: DataLoader, device: torch.device, epoch: int, out_dir: Path):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    model.eval()
+    
+    with torch.no_grad():
+        for batch in val_loader:
+            images = batch["image"].to(device, non_blocking=True)
+            masks = batch["mask"].to(device, non_blocking=True)
+            logits = model(images)
+            preds = (torch.sigmoid(logits) > 0.5).float()
+            
+            n_samples = min(images.size(0), 4)
+            fig, axes = plt.subplots(n_samples, 3, figsize=(12, 3 * n_samples))
+            if n_samples == 1:
+                axes = np.expand_dims(axes, 0)
+                
+            for i in range(n_samples):
+                axes[i, 0].imshow(images[i, 0].cpu().numpy(), cmap="gray")
+                axes[i, 0].set_title("Input (H-alpha)")
+                axes[i, 0].axis("off")
+                
+                axes[i, 1].imshow(masks[i, 0].cpu().numpy(), cmap="gray")
+                axes[i, 1].set_title("Ground Truth")
+                axes[i, 1].axis("off")
+                
+                axes[i, 2].imshow(preds[i, 0].cpu().numpy(), cmap="gray")
+                axes[i, 2].set_title("Prediction")
+                axes[i, 2].axis("off")
+                
+            plt.tight_layout()
+            plt.savefig(out_dir / f"val_epoch_{epoch + 1}.png", dpi=120, bbox_inches="tight")
+            plt.close()
+            break
+
+
 def run_training(args):
-    from torch.utils.data import DataLoader
-    from dataset import solar_collate_fn
-    from losses import MicroFilNetLoss
+    use_ddp = "RANK" in os.environ and "WORLD_SIZE" in os.environ
+    rank = int(os.environ.get("RANK", 0))
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
 
-    checkpoint_dir = Path(args.checkpoint_dir)
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
-    device = torch.device(
-        args.device if (args.device == "cuda" and torch.cuda.is_available()) else "cpu"
-    )
+    if use_ddp:
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+        dist.init_process_group(backend="nccl", init_method="env://")
+    else:
+        device = torch.device(args.device if (args.device == "cuda" and torch.cuda.is_available()) else "cpu")
 
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
+    checkpoint_dir = Path(args.checkpoint_dir)
+    val_plot_dir = Path(args.val_plot_dir) if args.val_plot_dir else (checkpoint_dir / "plots")
+    if rank == 0:
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        val_plot_dir.mkdir(parents=True, exist_ok=True)
+
     model = MicroFilNet().to(device)
+    if use_ddp:
+        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
+
     criterion = MicroFilNetLoss()
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=args.lr, weight_decay=args.weight_decay
-    )
+    raw_model = model.module if use_ddp else model
+    optimizer = torch.optim.AdamW(raw_model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
-    ema = ModelEMA(model, decay=args.ema_decay, device=device) if args.use_ema else None
+    ema = ModelEMA(raw_model, decay=args.ema_decay, device=device) if (args.use_ema and rank == 0) else None
     scaler = torch.amp.GradScaler("cuda") if (args.use_amp and device.type == "cuda") else None
 
     start_epoch = 0
@@ -88,7 +142,7 @@ def run_training(args):
     if args.resume:
         chk_path = Path(args.resume)
         if chk_path.exists():
-            info = load_checkpoint(str(chk_path), model, optimizer, ema, scheduler, str(device))
+            info = load_checkpoint(str(chk_path), raw_model, optimizer, ema, scheduler, str(device))
             start_epoch = info["epoch"] + 1
             best_loss = info["loss"]
 
@@ -111,10 +165,14 @@ def run_training(args):
         generator=torch.Generator().manual_seed(42),
     )
 
+    train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True) if use_ddp else None
+    val_sampler = DistributedSampler(val_ds, num_replicas=world_size, rank=rank, shuffle=False) if (use_ddp and val_len > 0) else None
+
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         num_workers=args.num_workers,
         pin_memory=(device.type == "cuda"),
         collate_fn=solar_collate_fn,
@@ -127,6 +185,7 @@ def run_training(args):
             val_ds,
             batch_size=args.batch_size,
             shuffle=False,
+            sampler=val_sampler,
             num_workers=args.num_workers,
             pin_memory=(device.type == "cuda"),
             collate_fn=solar_collate_fn,
@@ -138,6 +197,9 @@ def run_training(args):
     )
 
     for epoch in range(start_epoch, args.epochs):
+        if use_ddp and train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+
         train_metrics = train_one_epoch(
             model=model,
             dataloader=train_loader,
@@ -147,58 +209,71 @@ def run_training(args):
             device=device,
             epoch=epoch,
             use_amp=(args.use_amp and device.type == "cuda"),
-            ema=ema,
+            ema=ema if rank == 0 else None,
         )
 
         current_loss = train_metrics["total_loss"]
+
         if val_loader is not None:
-            eval_model = ema.shadow_model if ema is not None else model
-            val_metrics = evaluate(eval_model, val_loader, criterion, device, epoch)
-            current_loss = val_metrics["total_loss"]
+            eval_target = ema.shadow_model if (ema is not None and rank == 0) else raw_model
+            val_metrics = evaluate(eval_target, val_loader, criterion, device, epoch)
+            val_loss = val_metrics["total_loss"]
+
+            if use_ddp:
+                loss_tensor = torch.tensor([val_loss], device=device)
+                dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
+                current_loss = loss_tensor.item()
+            else:
+                current_loss = val_loss
+
+            if rank == 0:
+                save_validation_plots(eval_target, val_loader, device, epoch, val_plot_dir)
 
         scheduler.step()
 
-        is_best = current_loss < best_loss
-        if is_best:
-            best_loss = current_loss
+        if rank == 0:
+            is_best = current_loss < best_loss
+            if is_best:
+                best_loss = current_loss
 
-        save_checkpoint(
-            model=model,
-            optimizer=optimizer,
-            epoch=epoch,
-            loss=current_loss,
-            filepath=str(checkpoint_dir / "last.pt"),
-            ema_model=ema,
-            scheduler=scheduler,
-        )
-
-        if is_best:
             save_checkpoint(
-                model=model,
+                model=raw_model,
                 optimizer=optimizer,
                 epoch=epoch,
                 loss=current_loss,
-                filepath=str(checkpoint_dir / "best_model.pt"),
+                filepath=str(checkpoint_dir / "last.pt"),
                 ema_model=ema,
                 scheduler=scheduler,
             )
 
-        if (epoch + 1) % args.save_interval == 0:
-            save_checkpoint(
-                model=model,
-                optimizer=optimizer,
-                epoch=epoch,
-                loss=current_loss,
-                filepath=str(checkpoint_dir / f"checkpoint_epoch_{epoch + 1}.pt"),
-                ema_model=ema,
-                scheduler=scheduler,
-            )
+            if is_best:
+                save_checkpoint(
+                    model=raw_model,
+                    optimizer=optimizer,
+                    epoch=epoch,
+                    loss=current_loss,
+                    filepath=str(checkpoint_dir / "best_model.pt"),
+                    ema_model=ema,
+                    scheduler=scheduler,
+                )
+
+            if (epoch + 1) % args.save_interval == 0:
+                save_checkpoint(
+                    model=raw_model,
+                    optimizer=optimizer,
+                    epoch=epoch,
+                    loss=current_loss,
+                    filepath=str(checkpoint_dir / f"checkpoint_epoch_{epoch + 1}.pt"),
+                    ema_model=ema,
+                    scheduler=scheduler,
+                )
+
+    if use_ddp:
+        dist.destroy_process_group()
 
 
 def run_prediction(args):
-    device = torch.device(
-        args.device if (args.device == "cuda" and torch.cuda.is_available()) else "cpu"
-    )
+    device = torch.device(args.device if (args.device == "cuda" and torch.cuda.is_available()) else "cpu")
 
     model = MicroFilNet().to(device)
     checkpoint_path = Path(args.weights)
