@@ -10,6 +10,9 @@ import torch
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 
+cv2.setNumThreads(0)
+cv2.ocl.setUseOpenCL(False)
+
 try:
     from astropy.io import fits
     _HAS_ASTROPY = True
@@ -17,10 +20,8 @@ except ImportError:
     _HAS_ASTROPY = False
 
 from preprocessing import (
-    class_balanced_sample,
     continuity_safe_augment,
     detect_solar_disk,
-    extract_tiles,
 )
 
 
@@ -57,7 +58,6 @@ class SolarFilamentDataset(Dataset):
 
         self.img_to_polygons: Dict[str, List[List[float]]] = {}
         self.img_dimensions: Dict[str, Tuple[int, int]] = {}
-        self._mask_cache: Dict[str, Optional[np.ndarray]] = {}
         if self.split == 'train':
             self._load_and_index_annotations()
 
@@ -151,9 +151,6 @@ class SolarFilamentDataset(Dataset):
         return arr
 
     def _generate_mask(self, file_name: str, fallback_shape: Tuple[int, int]) -> Optional[np.ndarray]:
-        if file_name in self._mask_cache:
-            return self._mask_cache[file_name]
-
         polygons = self.img_to_polygons.get(file_name)
         if polygons is None:
             polygons = next(
@@ -162,7 +159,6 @@ class SolarFilamentDataset(Dataset):
             )
 
         if not polygons:
-            self._mask_cache[file_name] = None
             return None
 
         h, w = self.img_dimensions.get(file_name, fallback_shape)
@@ -172,9 +168,7 @@ class SolarFilamentDataset(Dataset):
             pts = np.array(poly, dtype=np.int32).reshape(-1, 1, 2)
             cv2.fillPoly(mask, [pts], color=1)
 
-        mask = mask.astype(np.float32)
-        self._mask_cache[file_name] = mask
-        return mask
+        return mask.astype(np.float32)
 
     def _compute_ridge_prior(self, img_01: np.ndarray) -> np.ndarray:
         u8_img = (np.clip(img_01, 0.0, 1.0) * 255.0).astype(np.uint8)
@@ -219,23 +213,29 @@ class SolarFilamentDataset(Dataset):
             if gt_mask is None:
                 gt_mask = np.zeros((h, w), dtype=np.float32)
 
-            tiles = extract_tiles(
-                image_stack,
-                valid_mask,
-                gt_mask,
-                tile=self.tile_size,
-                overlap=self.overlap,
-            )
-            sampled = class_balanced_sample(tiles, positive_ratio=0.7, n=1)
+            polygons = self.img_to_polygons.get(img_path.name, [])
+            sample_positive = (len(polygons) > 0) and (np.random.rand() < 0.7)
 
-            if sampled:
-                img_tile, valid_tile, gt_tile, has_fil, (ty, tx) = sampled[0]
+            if sample_positive and len(polygons) > 0:
+                chosen_poly = polygons[np.random.randint(len(polygons))]
+                poly_pts = np.array(chosen_poly).reshape(-1, 2)
+                target_x = int(poly_pts[:, 0].mean())
+                target_y = int(poly_pts[:, 1].mean())
+
+                margin = self.tile_size // 4
+                tx = target_x - self.tile_size // 2 + np.random.randint(-margin, margin + 1)
+                ty = target_y - self.tile_size // 2 + np.random.randint(-margin, margin + 1)
             else:
-                img_tile = image_stack[:, :self.tile_size, :self.tile_size]
-                valid_tile = valid_mask[:, :self.tile_size, :self.tile_size]
-                gt_tile = gt_mask[:self.tile_size, :self.tile_size]
-                has_fil = bool(gt_tile.sum() > 0)
-                ty, tx = 0, 0
+                tx = np.random.randint(0, max(1, w - self.tile_size + 1))
+                ty = np.random.randint(0, max(1, h - self.tile_size + 1))
+
+            tx = int(np.clip(tx, 0, max(0, w - self.tile_size)))
+            ty = int(np.clip(ty, 0, max(0, h - self.tile_size)))
+
+            img_tile = image_stack[:, ty : ty + self.tile_size, tx : tx + self.tile_size]
+            valid_tile = valid_mask[:, ty : ty + self.tile_size, tx : tx + self.tile_size]
+            gt_tile = gt_mask[ty : ty + self.tile_size, tx : tx + self.tile_size]
+            has_fil = bool(gt_tile.sum() > 0)
 
             if self.augment:
                 img_tile, gt_tile, valid_tile = continuity_safe_augment(
@@ -302,55 +302,3 @@ def solar_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         'image_id': [b['image_id'] for b in batch],
         'disk': [b.get('disk') for b in batch],
     }
-
-
-def create_dataloaders(
-    data_root: str | Path,
-    batch_size: int = 8,
-    tile_size: int = 512,
-    overlap: float = 0.25,
-    val_split: float = 0.1,
-    num_workers: int = 4,
-    use_cache: bool = True,
-    seed: int = 42,
-) -> Tuple[DataLoader, Optional[DataLoader]]:
-    full_dataset = SolarFilamentDataset(
-        data_root=data_root,
-        split='train',
-        tile_size=tile_size,
-        overlap=overlap,
-        use_cache=use_cache,
-        augment=True,
-    )
-
-    total_samples = len(full_dataset)
-    val_size = int(total_samples * val_split)
-    train_size = total_samples - val_size
-
-    train_ds, val_ds = torch.utils.data.random_split(
-        full_dataset,
-        [train_size, val_size],
-        generator=torch.Generator().manual_seed(seed),
-    )
-
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
-        collate_fn=solar_collate_fn,
-        drop_last=True,
-    )
-
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
-        collate_fn=solar_collate_fn,
-        drop_last=False,
-    ) if val_size > 0 else None
-
-    return train_loader, val_loader
