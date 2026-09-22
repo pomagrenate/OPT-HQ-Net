@@ -46,7 +46,7 @@ Examples:
     train_parser.add_argument('--use_cache', action='store_true',
                              help='Use cached .npy files if available')
     train_parser.add_argument('--tile_size', type=int, default=256,
-                             help='Tile size for training patches (larger = better GPU utilization)')
+                             help='Tile size for training patches (larger = better GPU utilization, may cause OOM at 512)')
     train_parser.add_argument('--overlap', type=float, default=0.25,
                              help='Overlap fraction for tiling')
     train_parser.add_argument('--batch_size', type=int, default=4,
@@ -65,6 +65,8 @@ Examples:
                              help='Use exponential moving average')
     train_parser.add_argument('--device', type=str, default='cuda',
                              help='Device to use (cuda/cpu)')
+    train_parser.add_argument('--val_plot_dir', type=str, default=None,
+                             help='Directory to save validation plots (default: checkpoint_dir)')
     
     # Inference command
     predict_parser = subparsers.add_parser('predict', help='Run inference')
@@ -186,6 +188,13 @@ Examples:
         
         checkpoint_dir = Path(args.checkpoint_dir)
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Set validation plot directory
+        if args.val_plot_dir:
+            val_plot_dir = Path(args.val_plot_dir)
+            val_plot_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            val_plot_dir = checkpoint_dir
         
         # Create model
         model = MicroFilNet().to(device)
@@ -390,7 +399,7 @@ Examples:
                 
                 # Create visualization plots (only on rank 0)
                 if rank == 0:
-                    create_validation_plots(model, val_loader, device, epoch, checkpoint_dir)
+                    create_validation_plots(model, val_loader, device, epoch, val_plot_dir)
             else:
                 current_loss = avg_loss
             
@@ -529,7 +538,7 @@ Examples:
         print(f"Total filaments: {total_filaments}")
 
 
-def create_validation_plots(model, val_loader, device, epoch, checkpoint_dir):
+def create_validation_plots(model, val_loader, device, epoch, output_dir):
     """Create visualization plots of original vs segmented images."""
     import torch  # Import torch here to avoid namespace issues
     
@@ -577,7 +586,7 @@ def create_validation_plots(model, val_loader, device, epoch, checkpoint_dir):
             sample_idx += 1
     
     plt.tight_layout()
-    plot_path = checkpoint_dir / f'val_epoch_{epoch + 1}.png'
+    plot_path = output_dir / f'val_epoch_{epoch + 1}.png'
     plt.savefig(plot_path, dpi=100, bbox_inches='tight')
     plt.close()
     print(f"Saved validation plot: {plot_path}")
