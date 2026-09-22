@@ -19,7 +19,7 @@ from transformers import SegformerForSemanticSegmentation
 
 
 class SimMIMDecoder(nn.Module):
-    """Lightweight reconstruction decoder for SimMIM."""
+    """Lightweight reconstruction decoder for SimMIM with bilinear upsampling to avoid checkerboard artifacts."""
 
     def __init__(
         self,
@@ -29,68 +29,87 @@ class SimMIMDecoder(nn.Module):
     ) -> None:
         super().__init__()
 
-        # Progressive upsampling from stage 4 to full resolution
-        # Stage 4: stride 32 -> 16 -> 8 -> 4 -> 2 -> 1 (for 512x512 input)
-        self.decoder = nn.Sequential(
-            # Stage 4 to Stage 3 (stride 32 -> 16)
+        # Progressive upsampling from stage 4 (16x16) to full resolution (512x512)
+        # Using bilinear upsampling + Conv3x3 to avoid checkerboard artifacts
+        # Stage 4: 16x16 -> 32x32 -> 64x64 -> 128x128 -> 256x256 -> 512x512
+        
+        # Stage 4 features: (B, 256, 16, 16) for 512x512 input
+        self.up1 = nn.Sequential(
             nn.Conv2d(encoder_channels, hidden_dim, kernel_size=3, padding=1),
             nn.GroupNorm(8, hidden_dim),
             nn.GELU(),
-            nn.ConvTranspose2d(hidden_dim, hidden_dim // 2, kernel_size=4, stride=2, padding=1),
+        )
+        
+        self.up2 = nn.Sequential(
+            nn.Conv2d(hidden_dim, hidden_dim // 2, kernel_size=3, padding=1),
             nn.GroupNorm(8, hidden_dim // 2),
             nn.GELU(),
-
-            # Stage 3 to Stage 2 (stride 16 -> 8)
-            nn.Conv2d(hidden_dim // 2, hidden_dim // 2, kernel_size=3, padding=1),
-            nn.GroupNorm(8, hidden_dim // 2),
-            nn.GELU(),
-            nn.ConvTranspose2d(hidden_dim // 2, hidden_dim // 4, kernel_size=4, stride=2, padding=1),
+        )
+        
+        self.up3 = nn.Sequential(
+            nn.Conv2d(hidden_dim // 2, hidden_dim // 4, kernel_size=3, padding=1),
             nn.GroupNorm(8, hidden_dim // 4),
             nn.GELU(),
-
-            # Stage 2 to Stage 1 (stride 8 -> 4)
-            nn.Conv2d(hidden_dim // 4, hidden_dim // 4, kernel_size=3, padding=1),
-            nn.GroupNorm(8, hidden_dim // 4),
-            nn.GELU(),
-            nn.ConvTranspose2d(hidden_dim // 4, hidden_dim // 8, kernel_size=4, stride=2, padding=1),
+        )
+        
+        self.up4 = nn.Sequential(
+            nn.Conv2d(hidden_dim // 4, hidden_dim // 8, kernel_size=3, padding=1),
             nn.GroupNorm(8, hidden_dim // 8),
             nn.GELU(),
-
-            # Stage 1 to stride 2 (stride 4 -> 2)
-            nn.Conv2d(hidden_dim // 8, hidden_dim // 8, kernel_size=3, padding=1),
-            nn.GroupNorm(8, hidden_dim // 8),
-            nn.GELU(),
-            nn.ConvTranspose2d(hidden_dim // 8, hidden_dim // 16, kernel_size=4, stride=2, padding=1),
+        )
+        
+        self.up5 = nn.Sequential(
+            nn.Conv2d(hidden_dim // 8, hidden_dim // 16, kernel_size=3, padding=1),
             nn.GroupNorm(8, hidden_dim // 16),
             nn.GELU(),
-
-            # Stride 2 to full resolution (stride 2 -> 1)
-            nn.Conv2d(hidden_dim // 16, hidden_dim // 16, kernel_size=3, padding=1),
-            nn.GroupNorm(8, hidden_dim // 16),
-            nn.GELU(),
-            nn.ConvTranspose2d(hidden_dim // 16, hidden_dim // 32, kernel_size=4, stride=2, padding=1),
-            nn.GroupNorm(8, hidden_dim // 32),
-            nn.GELU(),
-
-            # Final projection to grayscale
-            nn.Conv2d(hidden_dim // 32, output_channels, kernel_size=3, padding=1),
+        )
+        
+        # Final projection to grayscale
+        self.final_conv = nn.Sequential(
+            nn.Conv2d(hidden_dim // 16, output_channels, kernel_size=3, padding=1),
+            nn.Sigmoid(),  # Ensure output is in [0, 1] range
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass.
+        Forward pass with progressive bilinear upsampling.
 
         Parameters
         ----------
         x : Tensor (B, C, H, W)
-            Encoder feature map from stage 4
+            Encoder feature map from stage 4 (typically 16x16 for 512x512 input)
 
         Returns
         -------
         reconstructed : Tensor (B, 1, H*32, W*32)
             Reconstructed grayscale image at full resolution
         """
-        return self.decoder(x)
+        # Initial projection
+        x = self.up1(x)
+        
+        # Progressive upsampling: 16x16 -> 32x32
+        x = F.interpolate(x, scale_factor=2, mode='bilinear', align_corners=False)
+        x = self.up2(x)
+        
+        # 32x32 -> 64x64
+        x = F.interpolate(x, scale_factor=2, mode='bilinear', align_corners=False)
+        x = self.up3(x)
+        
+        # 64x64 -> 128x128
+        x = F.interpolate(x, scale_factor=2, mode='bilinear', align_corners=False)
+        x = self.up4(x)
+        
+        # 128x128 -> 256x256
+        x = F.interpolate(x, scale_factor=2, mode='bilinear', align_corners=False)
+        x = self.up5(x)
+        
+        # 256x256 -> 512x512
+        x = F.interpolate(x, scale_factor=2, mode='bilinear', align_corners=False)
+        
+        # Final projection
+        x = self.final_conv(x)
+        
+        return x
 
 
 class SimMIMSegFormer(nn.Module):
@@ -212,16 +231,6 @@ class SimMIMSegFormer(nn.Module):
             new_proj.bias = nn.Parameter(original_proj.bias)
 
         return new_proj
-
-        # Reconstruction decoder
-        self.decoder = SimMIMDecoder(
-            encoder_channels=256,  # SegFormer B0 stage 4 channels
-            hidden_dim=256,
-            output_channels=1,
-        )
-
-        # Mask token embedding (learnable)
-        self.mask_token = nn.Parameter(torch.zeros(1, 256, 1, 1))
 
     def random_masking(
         self,

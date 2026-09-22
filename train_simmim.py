@@ -41,6 +41,8 @@ def parse_args():
     parser.add_argument("--val_freq", type=int, default=2, help="Validation frequency (epochs)")
     parser.add_argument("--val_ratio", type=float, default=0.05, help="Validation ratio (5% of data)")
     parser.add_argument("--vis_dir", type=str, default="visualizations", help="Visualization directory")
+    parser.add_argument("--use_edge_loss", action="store_true", help="Add Sobel edge loss for sharpness")
+    parser.add_argument("--edge_loss_weight", type=float, default=0.1, help="Edge loss weight")
     parser.add_argument("--use_amp", action="store_true", help="Use Automatic Mixed Precision")
     parser.add_argument("--tile_size", type=int, default=512, help="Tile size")
     parser.add_argument("--stride", type=int, default=512, help="Stride for tiling")
@@ -54,11 +56,15 @@ def train_one_epoch(
     scaler: GradScaler | None,
     device: torch.device,
     use_amp: bool,
+    use_edge_loss: bool = False,
+    edge_loss_weight: float = 0.1,
 ) -> Dict[str, float]:
     """Train for one epoch."""
     model.train()
     total_loss = 0.0
     total_samples = 0
+    total_recon_loss = 0.0
+    total_edge_loss = 0.0
 
     pbar = tqdm(dataloader, desc="Training")
     for batch in pbar:
@@ -76,21 +82,42 @@ def train_one_epoch(
                 mask = outputs['mask']
 
                 # L1 loss on masked regions only
-                loss = F.l1_loss(
+                recon_loss = F.l1_loss(
                     reconstructed * mask,
                     images * mask,
                     reduction='mean'
                 )
+                
+                # Edge loss for sharpness
+                if use_edge_loss:
+                    edge_loss = sobel_edge_loss(
+                        reconstructed * mask,
+                        images * mask
+                    )
+                    loss = recon_loss + edge_loss_weight * edge_loss
+                else:
+                    loss = recon_loss
+                    edge_loss = torch.tensor(0.0)
         else:
             outputs = model(images, mask=mask)
             reconstructed = outputs['reconstructed']
             mask = outputs['mask']
 
-            loss = F.l1_loss(
+            recon_loss = F.l1_loss(
                 reconstructed * mask,
                 images * mask,
                 reduction='mean'
             )
+            
+            if use_edge_loss:
+                edge_loss = sobel_edge_loss(
+                    reconstructed * mask,
+                    images * mask
+                )
+                loss = recon_loss + edge_loss_weight * edge_loss
+            else:
+                loss = recon_loss
+                edge_loss = torch.tensor(0.0)
 
         # Backward pass
         optimizer.zero_grad()
@@ -103,13 +130,55 @@ def train_one_epoch(
             optimizer.step()
 
         total_loss += loss.item() * images.size(0)
+        total_recon_loss += recon_loss.item() * images.size(0)
+        total_edge_loss += edge_loss.item() * images.size(0)
         total_samples += images.size(0)
 
         pbar.set_postfix({
             'loss': f"{loss.item():.4f}",
+            'recon': f"{recon_loss.item():.4f}",
+            'edge': f"{edge_loss.item():.4f}" if use_edge_loss else "N/A",
         })
 
-    return {'loss': total_loss / total_samples}
+    return {
+        'loss': total_loss / total_samples,
+        'recon_loss': total_recon_loss / total_samples,
+        'edge_loss': total_edge_loss / total_samples if use_edge_loss else 0.0,
+    }
+
+
+def sobel_edge_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """
+    Compute Sobel edge loss to encourage sharp predictions.
+    
+    Parameters
+    ----------
+    pred : Tensor (B, 1, H, W)
+        Predicted reconstruction
+    target : Tensor (B, 1, H, W)
+        Target image
+        
+    Returns
+    -------
+    edge_loss : Tensor
+        L1 loss on Sobel edges
+    """
+    # Sobel kernels
+    sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], 
+                           dtype=pred.dtype, device=pred.device).view(1, 1, 3, 3)
+    sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], 
+                           dtype=pred.dtype, device=pred.device).view(1, 1, 3, 3)
+    
+    # Compute edges
+    pred_edge_x = F.conv2d(pred, sobel_x, padding=1)
+    pred_edge_y = F.conv2d(pred, sobel_y, padding=1)
+    target_edge_x = F.conv2d(target, sobel_x, padding=1)
+    target_edge_y = F.conv2d(target, sobel_y, padding=1)
+    
+    pred_edge = torch.sqrt(pred_edge_x**2 + pred_edge_y**2)
+    target_edge = torch.sqrt(target_edge_x**2 + target_edge_y**2)
+    
+    return F.l1_loss(pred_edge, target_edge, reduction='mean')
 
 
 def validate(
@@ -157,12 +226,12 @@ def visualize_reconstruction(
     num_samples: int = 4,
 ) -> None:
     """
-    Visualize reconstruction comparisons.
+    Visualize reconstruction comparisons with composite inpainting.
 
     Creates a figure with 3 columns:
     - Column 1: Original image
     - Column 2: Masked input
-    - Column 3: Reconstruction
+    - Column 3: Composite reconstruction (original * (1-mask) + pred * mask)
     """
     model.eval()
     vis_dir.mkdir(parents=True, exist_ok=True)
@@ -188,6 +257,10 @@ def visualize_reconstruction(
     reconstructed_np = reconstructed.cpu().numpy()
     mask_np = mask.cpu().numpy()
 
+    # Create composite reconstruction (MAE/SimMIM style)
+    # composite = original * (1 - mask) + reconstruction * mask
+    composite_np = sample_images_np * (1 - mask_np) + reconstructed_np * mask_np
+
     # Create figure
     fig, axes = plt.subplots(num_samples, 3, figsize=(12, 4 * num_samples))
     if num_samples == 1:
@@ -204,9 +277,9 @@ def visualize_reconstruction(
         axes[i, 1].set_title('Masked Input')
         axes[i, 1].axis('off')
 
-        # Reconstruction
-        axes[i, 2].imshow(reconstructed_np[i, 0], cmap='gray', vmin=0, vmax=1)
-        axes[i, 2].set_title('Reconstruction')
+        # Composite reconstruction
+        axes[i, 2].imshow(composite_np[i, 0], cmap='gray', vmin=0, vmax=1)
+        axes[i, 2].set_title('Composite Reconstruction')
         axes[i, 2].axis('off')
 
     plt.suptitle(f'Epoch {epoch} - Reconstruction Comparison', fontsize=14, fontweight='bold')
@@ -344,9 +417,11 @@ def main():
             scaler,
             device,
             args.use_amp,
+            args.use_edge_loss,
+            args.edge_loss_weight,
         )
 
-        print(f"Train Loss: {metrics['loss']:.4f}")
+        print(f"Train Loss: {metrics['loss']:.4f} (Recon: {metrics['recon_loss']:.4f}, Edge: {metrics['edge_loss']:.4f})")
 
         # Validate every val_freq epochs
         if epoch % args.val_freq == 0:
