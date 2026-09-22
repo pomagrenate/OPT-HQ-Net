@@ -212,7 +212,12 @@ def main():
     # Create gradient scaler for AMP
     scaler = None
     if args.use_amp:
-        scaler = GradScaler()
+        try:
+            from torch.amp import GradScaler
+            scaler = GradScaler('cuda')
+        except ImportError:
+            from torch.cuda.amp import GradScaler
+            scaler = GradScaler()
     
     # Load checkpoint if resuming
     start_epoch = 0

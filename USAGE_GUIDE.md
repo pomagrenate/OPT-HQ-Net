@@ -9,11 +9,10 @@ Your MAGFiLO dataset should be organized as follows:
 ```
 MAGFiLO_1.0_Kaggle_2026/
 ├── train/
-│   ├── images/           # H-alpha FITS files or PNG images
-│   ├── masks/            # Ground truth binary masks
-│   └── annotations.json  # Optional metadata
+│   ├── train_images/                    # H-alpha JPEG images
+│   └── MAGFiLO_1.0_Annotations_kaggle2026_train.json  # COCO-format annotations
 └── test/
-    └── images/           # Test images for inference
+    └── test_images/                     # H-alpha JPEG images for inference
 ```
 
 ## 🚀 Quick Start
@@ -29,13 +28,13 @@ pip install -r requirements.txt
 Using the main interface:
 
 ```bash
-python main.py train --data_root /path/to/MAGFiLO_1.0_Kaggle_2026/train
+python main.py train --data_root /path/to/MAGFiLO_1.0_Kaggle_2026
 ```
 
 Or using the standalone training script:
 
 ```bash
-python train.py --data_root /path/to/MAGFiLO_1.0_Kaggle_2026/train --epochs 50 --batch_size 4
+python train.py --data_root /path/to/MAGFiLO_1.0_Kaggle_2026 --epochs 50 --batch_size 4
 ```
 
 ### 3. Run Inference
@@ -43,13 +42,13 @@ python train.py --data_root /path/to/MAGFiLO_1.0_Kaggle_2026/train --epochs 50 -
 Using the main interface:
 
 ```bash
-python main.py predict --weights checkpoints/best_model.pt --data_root /path/to/MAGFiLO_1.0_Kaggle_2026/test
+python main.py predict --weights checkpoints/best_model.pt --data_root /path/to/MAGFiLO_1.0_Kaggle_2026
 ```
 
 Or using the standalone inference script:
 
 ```bash
-python predict.py --weights checkpoints/best_model.pt --data_root /path/to/MAGFiLO_1.0_Kaggle_2026/test --output submission.csv
+python predict.py --weights checkpoints/best_model.pt --data_root /path/to/MAGFiLO_1.0_Kaggle_2026 --output submission.csv
 ```
 
 ## 📋 Command Options
@@ -58,13 +57,13 @@ python predict.py --weights checkpoints/best_model.pt --data_root /path/to/MAGFi
 
 #### Basic Training
 ```bash
-python main.py train --data_root /path/to/train
+python main.py train --data_root /path/to/MAGFiLO_1.0_Kaggle_2026
 ```
 
 #### Training with Custom Parameters
 ```bash
 python main.py train \
-    --data_root /path/to/train \
+    --data_root /path/to/MAGFiLO_1.0_Kaggle_2026 \
     --batch_size 8 \
     --epochs 100 \
     --lr 1e-4 \
@@ -75,14 +74,14 @@ python main.py train \
 #### Resume Training
 ```bash
 python main.py train \
-    --data_root /path/to/train \
+    --data_root /path/to/MAGFiLO_1.0_Kaggle_2026 \
     --resume last
 ```
 
 #### Resume from Specific Checkpoint
 ```bash
 python main.py train \
-    --data_root /path/to/train \
+    --data_root /path/to/MAGFiLO_1.0_Kaggle_2026 \
     --resume checkpoints/checkpoint_epoch_25.pt
 ```
 
@@ -92,14 +91,14 @@ python main.py train \
 ```bash
 python main.py predict \
     --weights checkpoints/best_model.pt \
-    --data_root /path/to/test
+    --data_root /path/to/MAGFiLO_1.0_Kaggle_2026
 ```
 
 #### Inference with Custom Parameters
 ```bash
 python main.py predict \
     --weights checkpoints/best_model.pt \
-    --data_root /path/to/test \
+    --data_root /path/to/MAGFiLO_1.0_Kaggle_2026 \
     --threshold 0.5 \
     --min_area 30 \
     --output my_submission.csv
@@ -147,7 +146,7 @@ Training creates the following checkpoints in the `checkpoints/` directory:
 ```bash
 # 1. Train the model
 python main.py train \
-    --data_root /path/to/MAGFiLO_1.0_Kaggle_2026/train \
+    --data_root /path/to/MAGFiLO_1.0_Kaggle_2026 \
     --epochs 50 \
     --batch_size 4 \
     --use_amp \
@@ -156,7 +155,7 @@ python main.py train \
 # 2. Run inference on test data
 python main.py predict \
     --weights checkpoints/best_model.pt \
-    --data_root /path/to/MAGFiLO_1.0_Kaggle_2026/test \
+    --data_root /path/to/MAGFiLO_1.0_Kaggle_2026 \
     --output submission.csv
 
 # 3. Check the submission file

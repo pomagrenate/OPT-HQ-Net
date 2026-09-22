@@ -129,7 +129,12 @@ Examples:
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
         
         ema = ModelEMA(model, decay=0.9999, device=device) if args.use_ema else None
-        scaler = GradScaler() if args.use_amp else None
+        try:
+            from torch.amp import GradScaler
+            scaler = GradScaler('cuda') if args.use_amp else None
+        except ImportError:
+            from torch.cuda.amp import GradScaler
+            scaler = GradScaler() if args.use_amp else None
         
         # Load checkpoint if resuming
         start_epoch = 0

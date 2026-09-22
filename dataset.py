@@ -30,9 +30,9 @@ class SolarFilamentDataset(Dataset):
     
     Expected directory structure:
     data_root/
-    ├── images/           # H-alpha FITS files
-    ├── masks/            # Ground truth binary masks
-    └── annotations.json  # Optional metadata
+    ├── train_images/      # H-alpha JPEG files (training)
+    ├── test_images/       # H-alpha JPEG files (testing)
+    └── MAGFiLO_1.0_Annotations_kaggle2026_train.json  # Training annotations
     """
     
     def __init__(self, data_root: str, split: str = 'train', 
@@ -54,16 +54,20 @@ class SolarFilamentDataset(Dataset):
         self.use_cache = use_cache
         self.transform = transform
         
+        # Determine image directory based on split
+        if split == 'train':
+            self.image_dir = self.data_root / "train_images"
+            self.annotations_file = self.data_root / "MAGFiLO_1.0_Annotations_kaggle2026_train.json"
+        else:
+            self.image_dir = self.data_root / "test_images"
+            self.annotations_file = None
+        
         # Check if using cached .npy format
-        cache_dir = self.data_root / "images"
-        if self.use_cache and cache_dir.exists():
-            npy_files = list(cache_dir.glob("*.npy"))
+        if self.use_cache and self.image_dir.exists():
+            npy_files = list(self.image_dir.glob("*.npy"))
             if npy_files:
                 self.use_npy_cache = True
                 self.image_files = sorted(npy_files)
-                self.mask_files = []
-                if (self.data_root / "masks").exists():
-                    self.mask_files = sorted((self.data_root / "masks").glob("*.npy"))
                 print(f"Using cached .npy format: {len(self.image_files)} images")
             else:
                 self.use_npy_cache = False
@@ -71,29 +75,25 @@ class SolarFilamentDataset(Dataset):
             self.use_npy_cache = False
             
         if not self.use_npy_cache:
-            # Look for FITS files (H-alpha images)
-            self.image_dir = self.data_root / "images"
-            self.mask_dir = self.data_root / "masks"
-            
+            # Look for image files
             if not self.image_dir.exists():
                 raise ValueError(f"Image directory not found: {self.image_dir}")
             
-            # Get all image files
-            image_extensions = ['.fits', '.fit', '.png', '.jpg', '.jpeg']
+            # Get all image files (support JPEG, PNG, FITS)
+            image_extensions = ['.jpeg', '.jpg', '.png', '.fits', '.fit']
             self.image_files = []
             for ext in image_extensions:
                 self.image_files.extend(self.image_dir.glob(f"*{ext}"))
             
             self.image_files = sorted(self.image_files)
             
-            if split == 'train' and self.mask_dir.exists():
-                mask_extensions = ['.png', '.jpg', '.jpeg', '.npy']
-                self.mask_files = []
-                for ext in mask_extensions:
-                    self.mask_files.extend(self.mask_dir.glob(f"*{ext}"))
-                self.mask_files = sorted(self.mask_files)
-            else:
-                self.mask_files = []
+            # Load annotations for training
+            self.annotations = None
+            if split == 'train' and self.annotations_file.exists():
+                import json
+                with open(self.annotations_file, 'r') as f:
+                    self.annotations = json.load(f)
+                print(f"Loaded annotations with {len(self.annotations.get('annotations', []))} entries")
         
         print(f"Loaded {len(self.image_files)} images for {split} split")
         
@@ -116,17 +116,66 @@ class SolarFilamentDataset(Dataset):
             
         return data
     
-    def load_mask(self, mask_path: Optional[Path]) -> Optional[np.ndarray]:
-        """Load a mask from file (supports PNG, NPY)."""
-        if mask_path is None or not mask_path.exists():
+    def load_mask_from_annotations(self, image_name: str) -> Optional[np.ndarray]:
+        """Load mask from COCO-format JSON annotations based on image name."""
+        if self.annotations is None:
             return None
-            
-        if mask_path.suffix.lower() == '.npy':
-            mask = np.load(mask_path).astype(np.float32)
-        else:
-            mask = Image.open(mask_path).convert('L')
-            mask = np.array(mask, dtype=np.float32) / 255.0
-            
+        
+        # Find the image ID for this image
+        image_id = None
+        for img_info in self.annotations.get('images', []):
+            if img_info.get('file_name') == image_name:
+                image_id = img_info.get('id')
+                break
+        
+        if image_id is None:
+            return None
+        
+        # Find all annotations for this image
+        annotations = []
+        for annotation in self.annotations.get('annotations', []):
+            if annotation.get('image_id') == image_id:
+                annotations.append(annotation)
+        
+        if not annotations:
+            return None
+        
+        # Create a binary mask from polygon annotations
+        # Get image dimensions
+        img_info = next((img for img in self.annotations.get('images', []) if img.get('id') == image_id), None)
+        if img_info is None:
+            return None
+        
+        height = img_info.get('height', 2048)
+        width = img_info.get('width', 2048)
+        
+        # Create empty mask
+        mask = np.zeros((height, width), dtype=np.float32)
+        
+        # Fill mask with polygons
+        try:
+            from pycocotools import mask as coco_mask
+            for annotation in annotations:
+                if 'segmentation' in annotation:
+                    # Convert polygon to binary mask
+                    rle = coco_mask.frPyObjects(annotation['segmentation'], height, width)
+                    binary_mask = coco_mask.decode(rle)
+                    mask = np.maximum(mask, binary_mask)
+        except ImportError:
+            # Fallback: simple polygon filling without pycocotools
+            for annotation in annotations:
+                if 'segmentation' in annotation:
+                    polygons = annotation['segmentation']
+                    for polygon in polygons:
+                        # Reshape polygon to (N, 2)
+                        poly_points = np.array(polygon).reshape(-1, 2)
+                        # Create a temporary mask for this polygon
+                        from PIL import Image, ImageDraw
+                        temp_mask = Image.new('L', (width, height), 0)
+                        draw = ImageDraw.Draw(temp_mask)
+                        draw.polygon([tuple(point) for point in poly_points], fill=1)
+                        mask = np.maximum(mask, np.array(temp_mask))
+        
         return mask
     
     def __getitem__(self, idx: int) -> dict:
@@ -140,8 +189,8 @@ class SolarFilamentDataset(Dataset):
         
         # Load mask if available (training mode)
         mask_data = None
-        if self.split == 'train' and self.mask_files and idx < len(self.mask_files):
-            mask_data = self.load_mask(self.mask_files[idx])
+        if self.split == 'train':
+            mask_data = self.load_mask_from_annotations(image_path.name)
         
         # Preprocess
         processed = preprocess_observation(image_data)
