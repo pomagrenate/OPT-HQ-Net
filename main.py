@@ -121,6 +121,17 @@ Examples:
             from torch.cuda.amp import autocast, GradScaler
             use_new_amp = False
         
+        # Debug: Print actual data path structure
+        if not use_ddp or local_rank == 0:
+            print(f"Data root path: {args.data_root}")
+            print(f"Checking for train directories:")
+            for path in [
+                Path(args.data_root) / "train" / "train_images",
+                Path(args.data_root) / "train_images",
+                Path(args.data_root) / "train"
+            ]:
+                print(f"  {path}: exists={path.exists()}")
+        
         from model import MicroFilNet
         from losses import MicroFilNetLoss
         from dataset import SolarFilamentDataset, create_dataloaders, collate_fn

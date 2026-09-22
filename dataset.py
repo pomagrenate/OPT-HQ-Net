@@ -55,11 +55,53 @@ class SolarFilamentDataset(Dataset):
         self.transform = transform
         
         # Determine image directory based on split
+        # Handle both directory structures:
+        # 1. data_root/train/train_images (MAGFiLO structure)
+        # 2. data_root/train_images (flat structure)
         if split == 'train':
-            self.image_dir = self.data_root / "train_images"
-            self.annotations_file = self.data_root / "MAGFiLO_1.0_Annotations_kaggle2026_train.json"
+            # Try MAGFiLO structure first
+            possible_dirs = [
+                self.data_root / "train" / "train_images",
+                self.data_root / "train_images",
+                self.data_root / "train"
+            ]
+            
+            for possible_dir in possible_dirs:
+                if possible_dir.exists():
+                    self.image_dir = possible_dir
+                    break
+            else:
+                raise ValueError(f"Image directory not found in any of: {possible_dirs}")
+            
+            # Try to find annotations file
+            possible_annotations = [
+                self.data_root / "train" / "MAGFiLO_1.0_Annotations_kaggle2026_train.json",
+                self.data_root / "MAGFiLO_1.0_Annotations_kaggle2026_train.json",
+                self.data_root / "annotations.json"
+            ]
+            
+            for possible_file in possible_annotations:
+                if possible_file.exists():
+                    self.annotations_file = possible_file
+                    break
+            else:
+                self.annotations_file = None
+                print("Warning: No annotations file found")
         else:
-            self.image_dir = self.data_root / "test_images"
+            # Test split
+            possible_dirs = [
+                self.data_root / "test" / "test_images",
+                self.data_root / "test_images",
+                self.data_root / "test"
+            ]
+            
+            for possible_dir in possible_dirs:
+                if possible_dir.exists():
+                    self.image_dir = possible_dir
+                    break
+            else:
+                raise ValueError(f"Image directory not found in any of: {possible_dirs}")
+            
             self.annotations_file = None
         
         # Check if using cached .npy format
