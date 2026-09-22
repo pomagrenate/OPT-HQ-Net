@@ -493,6 +493,8 @@ Examples:
 
 def create_validation_plots(model, val_loader, device, epoch, checkpoint_dir):
     """Create visualization plots of original vs segmented images."""
+    import torch  # Import torch here to avoid namespace issues
+    
     model.eval()
     
     # Get a few samples from validation
