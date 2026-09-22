@@ -13,11 +13,13 @@ from torch.utils.data import DataLoader, Subset
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
+cv2.setNumThreads(0)
+cv2.ocl.setUseOpenCL(False)
+
 from dataset import SolarFilamentDataset, solar_collate_fn
 from inference import postprocess_mask, tiled_predict
 from losses import MicroFilNetLoss
 from model import MicroFilNet
-from preprocessing import detect_solar_disk
 from utils import (
     ModelEMA,
     binary_mask_to_rle,
@@ -41,7 +43,7 @@ def parse_args():
     train_parser.add_argument("--lr", type=float, default=1e-4)
     train_parser.add_argument("--weight_decay", type=float, default=1e-5)
     train_parser.add_argument("--use_amp", action="store_true")
-    train_parser.add_argument("--num_workers", type=int, default=4)
+    train_parser.add_argument("--num_workers", type=int, default=2)
     train_parser.add_argument("--checkpoint_dir", type=str, default="checkpoints")
     train_parser.add_argument("--val_plot_dir", type=str, default=None)
     train_parser.add_argument("--resume", type=str, default=None)
@@ -111,9 +113,7 @@ def save_full_disk_validation_plot(
 
     h, w = image_stack.shape[1], image_stack.shape[2]
     valid_mask = np.ones((1, h, w), dtype=np.float32)
-
-    u8_disk = (np.clip(image_stack[0], 0.0, 1.0) * 255.0).astype(np.uint8)
-    cx, cy, r_sun = detect_solar_disk(u8_disk)
+    cx, cy, r_sun = w // 2, h // 2, int(0.45 * min(h, w))
 
     global_img = cv2.resize(image_stack[0], (512, 512), interpolation=cv2.INTER_AREA)
     global_ridge = cv2.resize(image_stack[1], (512, 512), interpolation=cv2.INTER_AREA)

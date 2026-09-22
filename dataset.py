@@ -19,10 +19,7 @@ try:
 except ImportError:
     _HAS_ASTROPY = False
 
-from preprocessing import (
-    continuity_safe_augment,
-    detect_solar_disk,
-)
+from preprocessing import continuity_safe_augment
 
 
 class SolarFilamentDataset(Dataset):
@@ -199,8 +196,8 @@ class SolarFilamentDataset(Dataset):
         else:
             raise ValueError(f"Unexpected image shape {raw_arr.shape} at {img_path}")
 
-        u8_disk = (np.clip(image_stack[0], 0.0, 1.0) * 255.0).astype(np.uint8)
-        cx, cy, r_sun = detect_solar_disk(u8_disk)
+        cx, cy = w // 2, h // 2
+        r_sun = int(0.45 * min(h, w))
 
         global_img = cv2.resize(image_stack[0], (self.global_size, self.global_size), interpolation=cv2.INTER_AREA)
         global_ridge = cv2.resize(image_stack[1], (self.global_size, self.global_size), interpolation=cv2.INTER_AREA)
