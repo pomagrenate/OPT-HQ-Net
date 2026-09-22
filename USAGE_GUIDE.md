@@ -31,6 +31,11 @@ Using the main interface:
 python main.py train --data_root /path/to/MAGFiLO_1.0_Kaggle_2026
 ```
 
+For Kaggle (memory-optimized):
+```bash
+python main.py train --data_root /path/to/MAGFiLO_1.0_Kaggle_2026 --batch_size 2 --tile_size 128
+```
+
 Or using the standalone training script:
 
 ```bash
@@ -109,10 +114,10 @@ python main.py predict \
 ### Training Parameters
 
 - `--data_root`: Path to training data directory (required)
-- `--batch_size`: Batch size for training (default: 4)
+- `--batch_size`: Batch size for training (default: 2, use 2 for Kaggle)
 - `--epochs`: Number of training epochs (default: 50)
 - `--lr`: Learning rate (default: 1e-4)
-- `--tile_size`: Size of training patches (default: 256)
+- `--tile_size`: Size of training patches (default: 128, use 128 for Kaggle)
 - `--overlap`: Overlap fraction for tiling (default: 0.25)
 - `--use_amp`: Enable automatic mixed precision training
 - `--use_ema`: Enable exponential moving average of model weights
@@ -144,11 +149,12 @@ Training creates the following checkpoints in the `checkpoints/` directory:
 ### Complete Training and Inference Workflow
 
 ```bash
-# 1. Train the model
+# 1. Train the model (Kaggle-optimized)
 python main.py train \
     --data_root /path/to/MAGFiLO_1.0_Kaggle_2026 \
     --epochs 50 \
-    --batch_size 4 \
+    --batch_size 2 \
+    --tile_size 128 \
     --use_amp \
     --use_ema
 

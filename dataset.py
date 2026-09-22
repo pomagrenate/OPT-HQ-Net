@@ -152,17 +152,9 @@ class SolarFilamentDataset(Dataset):
         # Create empty mask
         mask = np.zeros((height, width), dtype=np.float32)
         
-        # Fill mask with polygons
+        # Fill mask with polygons - use PIL as fallback (lighter than pycocotools)
         try:
-            from pycocotools import mask as coco_mask
-            for annotation in annotations:
-                if 'segmentation' in annotation:
-                    # Convert polygon to binary mask
-                    rle = coco_mask.frPyObjects(annotation['segmentation'], height, width)
-                    binary_mask = coco_mask.decode(rle)
-                    mask = np.maximum(mask, binary_mask)
-        except ImportError:
-            # Fallback: simple polygon filling without pycocotools
+            from PIL import Image, ImageDraw
             for annotation in annotations:
                 if 'segmentation' in annotation:
                     polygons = annotation['segmentation']
@@ -170,11 +162,13 @@ class SolarFilamentDataset(Dataset):
                         # Reshape polygon to (N, 2)
                         poly_points = np.array(polygon).reshape(-1, 2)
                         # Create a temporary mask for this polygon
-                        from PIL import Image, ImageDraw
                         temp_mask = Image.new('L', (width, height), 0)
                         draw = ImageDraw.Draw(temp_mask)
                         draw.polygon([tuple(point) for point in poly_points], fill=1)
                         mask = np.maximum(mask, np.array(temp_mask))
+        except Exception as e:
+            print(f"Warning: Could not load mask for {image_name}: {e}")
+            return None
         
         return mask
     

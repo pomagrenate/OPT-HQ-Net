@@ -41,12 +41,12 @@ Examples:
                              help='Path to training data directory')
     train_parser.add_argument('--use_cache', action='store_true',
                              help='Use cached .npy files if available')
-    train_parser.add_argument('--tile_size', type=int, default=256,
-                             help='Tile size for training patches')
+    train_parser.add_argument('--tile_size', type=int, default=128,
+                             help='Tile size for training patches (reduce for Kaggle memory constraints)')
     train_parser.add_argument('--overlap', type=float, default=0.25,
                              help='Overlap fraction for tiling')
-    train_parser.add_argument('--batch_size', type=int, default=4,
-                             help='Batch size for training')
+    train_parser.add_argument('--batch_size', type=int, default=2,
+                             help='Batch size for training (reduce for Kaggle memory constraints)')
     train_parser.add_argument('--epochs', type=int, default=50,
                              help='Number of training epochs')
     train_parser.add_argument('--lr', type=float, default=1e-4,
@@ -162,7 +162,7 @@ Examples:
             data_root=args.data_root,
             batch_size=args.batch_size,
             tile_size=args.tile_size,
-            num_workers=2,
+            num_workers=0,  # Use 0 workers to avoid memory issues on Kaggle
             use_cache=args.use_cache
         )
         
