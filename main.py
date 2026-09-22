@@ -100,7 +100,7 @@ def save_validation_plots(
             images = batch["image"].to(device, non_blocking=True)
             masks = batch["mask"].to(device, non_blocking=True)
             logits = model(images)
-            preds = (torch.sigmoid(logits) > 0.5).float()
+            preds = (torch.sigmoid(logits.float()) > 0.5).float()
 
             n_samples = min(images.size(0), 4)
             fig, axes = plt.subplots(n_samples, 3, figsize=(12, 3 * n_samples))
@@ -243,7 +243,8 @@ def run_training(args):
 
             with torch.amp.autocast(device_type=device.type, enabled=(args.use_amp and device.type == "cuda")):
                 logits = model(images)
-                loss, _ = criterion(logits, masks, valid_masks, epoch)
+
+            loss, _ = criterion(logits.float(), masks.float(), valid_masks.float(), epoch)
 
             if args.use_amp and scaler is not None:
                 scaler.scale(loss).backward()
@@ -275,7 +276,7 @@ def run_training(args):
                     valid_masks = batch["valid_mask"].to(device, non_blocking=True)
                     masks = batch["mask"].to(device, non_blocking=True)
                     logits = eval_target(images)
-                    l_val, _ = criterion(logits, masks, valid_masks, epoch)
+                    l_val, _ = criterion(logits.float(), masks.float(), valid_masks.float(), epoch)
                     val_loss += l_val.item()
 
             val_loss = val_loss / max(val_batches, 1)

@@ -101,8 +101,8 @@ class MicroFilNetLoss(nn.Module):
         self.register_buffer("sobel_y", ky)
 
     def _sobel_edges(self, x: torch.Tensor) -> torch.Tensor:
-        sx = self.sobel_x.to(dtype=x.dtype)
-        sy = self.sobel_y.to(dtype=x.dtype)
+        sx = self.sobel_x.to(device=x.device, dtype=x.dtype)
+        sy = self.sobel_y.to(device=x.device, dtype=x.dtype)
         gx = F.conv2d(x, sx, padding=1)
         gy = F.conv2d(x, sy, padding=1)
         return torch.sqrt(gx.pow(2) + gy.pow(2) + 1e-8)
@@ -135,7 +135,7 @@ class MicroFilNetLoss(nn.Module):
         if w_cl > 0.0:
             l_cl = soft_cl_dice(prob_masked, target_masked, n_iter=self.skel_iters)
         else:
-            l_cl = torch.zeros((), device=logits.device, dtype=logits.dtype)
+            l_cl = torch.zeros((), device=logits.device, dtype=torch.float32)
 
         total = (
             self.w_bce * l_bce
