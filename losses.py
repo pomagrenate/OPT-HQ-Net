@@ -101,8 +101,10 @@ class MicroFilNetLoss(nn.Module):
         self.register_buffer("sobel_y", ky)
 
     def _sobel_edges(self, x: torch.Tensor) -> torch.Tensor:
-        gx = F.conv2d(x, self.sobel_x, padding=1)
-        gy = F.conv2d(x, self.sobel_y, padding=1)
+        sx = self.sobel_x.to(dtype=x.dtype)
+        sy = self.sobel_y.to(dtype=x.dtype)
+        gx = F.conv2d(x, sx, padding=1)
+        gy = F.conv2d(x, sy, padding=1)
         return torch.sqrt(gx.pow(2) + gy.pow(2) + 1e-8)
 
     def _boundary_loss(self, pred_prob: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -117,6 +119,10 @@ class MicroFilNetLoss(nn.Module):
         valid_mask: torch.Tensor,
         epoch: int,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        logits = logits.float()
+        target = target.float()
+        valid_mask = valid_mask.float()
+
         prob = torch.sigmoid(logits)
         prob_masked = prob * valid_mask
         target_masked = target * valid_mask
