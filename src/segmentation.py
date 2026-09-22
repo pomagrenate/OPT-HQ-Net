@@ -82,27 +82,55 @@ class SolarFilamentSegmentation(nn.Module):
 
         # Modify first layer to accept 1-channel input
         if in_channels == 1:
-            original_proj = self.encoder.segformer.stages[0].patch_embeddings.proj
-            original_weight = original_proj.weight
-            original_out_channels = original_weight.shape[0]
+            # Handle different transformers versions
+            if hasattr(self.encoder.segformer, 'stages'):
+                # Older version
+                original_proj = self.encoder.segformer.stages[0].patch_embeddings.proj
+                self.encoder.segformer.stages[0].patch_embeddings.proj = self._create_1ch_conv(original_proj, in_channels)
+            elif hasattr(self.encoder.segformer, 'encoder'):
+                # Newer version with nested encoder
+                if hasattr(self.encoder.segformer.encoder, 'patch_embeddings'):
+                    original_proj = self.encoder.segformer.encoder.patch_embeddings.proj
+                    self.encoder.segformer.encoder.patch_embeddings.proj = self._create_1ch_conv(original_proj, in_channels)
+                elif hasattr(self.encoder.segformer.encoder, 'embeddings'):
+                    # Even newer version
+                    original_proj = self.encoder.segformer.encoder.embeddings.patch_embeddings.proj
+                    self.encoder.segformer.encoder.embeddings.patch_embeddings.proj = self._create_1ch_conv(original_proj, in_channels)
+            else:
+                # Try to find the first conv layer
+                for name, module in self.encoder.segformer.named_modules():
+                    if isinstance(module, nn.Conv2d) and module.in_channels == 3:
+                        print(f"Found first conv layer: {name}")
+                        parent_name = '.'.join(name.split('.')[:-1])
+                        parent = self.encoder.segformer
+                        for part in parent_name.split('.'):
+                            parent = getattr(parent, part)
+                        last_name = name.split('.')[-1]
+                        setattr(parent, last_name, self._create_1ch_conv(module, in_channels))
+                        break
 
-            new_proj = nn.Conv2d(
-                in_channels,
-                original_out_channels,
-                kernel_size=original_proj.kernel_size,
-                stride=original_proj.stride,
-                padding=original_proj.padding,
-                bias=original_proj.bias is not None
+    def _create_1ch_conv(self, original_proj: nn.Conv2d, in_channels: int) -> nn.Conv2d:
+        """Create 1-channel conv from 3-channel conv."""
+        original_weight = original_proj.weight
+        original_out_channels = original_weight.shape[0]
+
+        new_proj = nn.Conv2d(
+            in_channels,
+            original_out_channels,
+            kernel_size=original_proj.kernel_size,
+            stride=original_proj.stride,
+            padding=original_proj.padding,
+            bias=original_proj.bias is not None
+        )
+
+        with torch.no_grad():
+            new_proj.weight = nn.Parameter(
+                original_weight.mean(dim=1, keepdim=True)
             )
+        if original_proj.bias is not None:
+            new_proj.bias = nn.Parameter(original_proj.bias)
 
-            with torch.no_grad():
-                new_proj.weight = nn.Parameter(
-                    original_weight.mean(dim=1, keepdim=True)
-                )
-            if original_proj.bias is not None:
-                new_proj.bias = nn.Parameter(original_proj.bias)
-
-            self.encoder.segformer.stages[0].patch_embeddings.proj = new_proj
+        return new_proj
 
         # Load SimMIM pre-trained weights if provided
         if simmim_checkpoint is not None:
@@ -151,16 +179,31 @@ class SolarFilamentSegmentation(nn.Module):
         else:
             encoder_state = checkpoint
 
-        # Load encoder weights (skip mismatched keys)
-        current_state = self.encoder.segformer.state_dict()
+        # Handle different encoder structures
+        if hasattr(self.encoder, 'segformer'):
+            target_model = self.encoder.segformer
+        else:
+            target_model = self.encoder
+
+        # Try to load with different possible keys
+        current_state = target_model.state_dict()
         matched_keys = []
 
         for name, param in encoder_state.items():
+            # Try direct match
             if name in current_state and param.shape == current_state[name].shape:
                 current_state[name] = param
                 matched_keys.append(name)
+            # Try with segformer prefix
+            elif f'segformer.{name}' in current_state and param.shape == current_state[f'segformer.{name}'].shape:
+                current_state[f'segformer.{name}'] = param
+                matched_keys.append(f'segformer.{name}')
+            # Try with encoder prefix
+            elif f'encoder.{name}' in current_state and param.shape == current_state[f'encoder.{name}'].shape:
+                current_state[f'encoder.{name}'] = param
+                matched_keys.append(f'encoder.{name}')
 
-        self.encoder.segformer.load_state_dict(current_state, strict=False)
+        target_model.load_state_dict(current_state, strict=False)
         print(f"Loaded {len(matched_keys)} encoder parameters from SimMIM checkpoint")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
