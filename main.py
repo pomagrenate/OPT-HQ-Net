@@ -129,12 +129,16 @@ Examples:
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
         
         ema = ModelEMA(model, decay=0.9999, device=device) if args.use_ema else None
+        
+        # Import autocast for AMP
         try:
-            from torch.amp import GradScaler
-            scaler = GradScaler('cuda') if args.use_amp else None
-        except ImportError:
-            from torch.cuda.amp import GradScaler
+            from torch.amp import autocast, GradScaler
             scaler = GradScaler() if args.use_amp else None
+            use_new_amp = True
+        except ImportError:
+            from torch.cuda.amp import autocast, GradScaler
+            scaler = GradScaler() if args.use_amp else None
+            use_new_amp = False
         
         # Load checkpoint if resuming
         start_epoch = 0
@@ -184,9 +188,14 @@ Examples:
                 optimizer.zero_grad()
                 
                 if args.use_amp:
-                    with autocast():
-                        logits = model(images)
-                        loss, parts = criterion(logits, masks, valid_masks, epoch)
+                    if use_new_amp:
+                        with autocast(device_type='cuda'):
+                            logits = model(images)
+                            loss, parts = criterion(logits, masks, valid_masks, epoch)
+                    else:
+                        with autocast():
+                            logits = model(images)
+                            loss, parts = criterion(logits, masks, valid_masks, epoch)
                     scaler.scale(loss).backward()
                     scaler.step(optimizer)
                     scaler.update()

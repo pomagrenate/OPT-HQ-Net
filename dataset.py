@@ -207,17 +207,17 @@ class SolarFilamentDataset(Dataset):
                 sample = {
                     'image': torch.from_numpy(img_tile).float(),
                     'valid_mask': torch.from_numpy(valid_tile).float(),
-                    'mask': torch.from_numpy(gt_tile).float(),
+                    'mask': torch.from_numpy(gt_tile).float().unsqueeze(0),  # Add channel dimension
                     'has_filament': has_fil,
                     'tile_coords': (y, x),
                     'image_id': image_path.stem
                 }
             else:
-                # Fallback if no valid tiles
+                # Fallback if no valid tiles - create a zero mask with proper shape
                 sample = {
                     'image': torch.from_numpy(processed.image).float(),
                     'valid_mask': torch.from_numpy(processed.valid_mask).float(),
-                    'mask': torch.zeros_like(processed.valid_mask),
+                    'mask': torch.zeros(1, *processed.valid_mask.shape).float(),  # Add channel dimension
                     'has_filament': False,
                     'tile_coords': (0, 0),
                     'image_id': image_path.stem

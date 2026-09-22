@@ -79,7 +79,7 @@ def parse_args():
 def train_epoch(model: nn.Module, dataloader: DataLoader, criterion: nn.Module,
                 optimizer: optim.Optimizer, device: str, epoch: int,
                 use_amp: bool = False, scaler: Optional[GradScaler] = None,
-                ema: Optional[ModelEMA] = None) -> dict:
+                ema: Optional[ModelEMA] = None, use_new_amp: bool = False) -> dict:
     """Train for one epoch."""
     model.train()
     
@@ -101,9 +101,14 @@ def train_epoch(model: nn.Module, dataloader: DataLoader, criterion: nn.Module,
         optimizer.zero_grad()
         
         if use_amp:
-            with autocast():
-                logits = model(images)
-                loss, parts = criterion(logits, masks, valid_masks, epoch)
+            if use_new_amp:
+                with autocast(device_type='cuda'):
+                    logits = model(images)
+                    loss, parts = criterion(logits, masks, valid_masks, epoch)
+            else:
+                with autocast():
+                    logits = model(images)
+                    loss, parts = criterion(logits, masks, valid_masks, epoch)
             
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -210,13 +215,15 @@ def main():
         ema = ModelEMA(model, decay=args.ema_decay, device=device)
     
     # Create gradient scaler for AMP
+    use_new_amp = False
     scaler = None
     if args.use_amp:
         try:
-            from torch.amp import GradScaler
-            scaler = GradScaler('cuda')
+            from torch.amp import autocast, GradScaler
+            scaler = GradScaler()
+            use_new_amp = True
         except ImportError:
-            from torch.cuda.amp import GradScaler
+            from torch.cuda.amp import autocast, GradScaler
             scaler = GradScaler()
     
     # Load checkpoint if resuming
@@ -264,7 +271,7 @@ def main():
         # Train
         train_metrics = train_epoch(
             model, train_loader, criterion, optimizer, device, epoch,
-            use_amp=args.use_amp, scaler=scaler, ema=ema
+            use_amp=args.use_amp, scaler=scaler, ema=ema, use_new_amp=use_new_amp
         )
         
         print(f"Train Loss: {train_metrics['total_loss']:.4f}")
