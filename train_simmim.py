@@ -2,7 +2,7 @@
 SimMIM Pre-training Script.
 
 Usage:
-    python train_simmim.py --data_root <path> --epochs 100 --batch_size 16
+    python train_simmim.py --data_root <path> --epochs 35 --batch_size 24
 """
 
 from __future__ import annotations
@@ -11,6 +11,8 @@ import argparse
 from pathlib import Path
 from typing import Dict
 
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -36,6 +38,9 @@ def parse_args():
     parser.add_argument("--num_workers", type=int, default=8, help="DataLoader workers (increased for speed)")
     parser.add_argument("--save_dir", type=str, default="checkpoints/simmim", help="Save directory")
     parser.add_argument("--save_freq", type=int, default=5, help="Save frequency (epochs)")
+    parser.add_argument("--val_freq", type=int, default=2, help="Validation frequency (epochs)")
+    parser.add_argument("--val_ratio", type=float, default=0.05, help="Validation ratio (5% of data)")
+    parser.add_argument("--vis_dir", type=str, default="visualizations", help="Visualization directory")
     parser.add_argument("--use_amp", action="store_true", help="Use Automatic Mixed Precision")
     parser.add_argument("--tile_size", type=int, default=512, help="Tile size")
     parser.add_argument("--stride", type=int, default=512, help="Stride for tiling")
@@ -107,6 +112,119 @@ def train_one_epoch(
     return {'loss': total_loss / total_samples}
 
 
+def validate(
+    model: nn.Module,
+    dataloader: DataLoader,
+    device: torch.device,
+) -> Dict[str, float]:
+    """Validate reconstruction on holdout set."""
+    model.eval()
+    total_loss = 0.0
+    total_samples = 0
+
+    with torch.no_grad():
+        for batch in tqdm(dataloader, desc="Validation"):
+            images = batch["image"].to(device)
+
+            # Generate random mask
+            mask = model.random_masking(images, model.mask_ratio)
+
+            # Forward pass
+            outputs = model(images, mask=mask)
+            reconstructed = outputs['reconstructed']
+            mask = outputs['mask']
+
+            # L1 loss on masked regions only
+            loss = F.l1_loss(
+                reconstructed * mask,
+                images * mask,
+                reduction='mean'
+            )
+
+            total_loss += loss.item() * images.size(0)
+            total_samples += images.size(0)
+
+    model.train()
+    return {'loss': total_loss / total_samples}
+
+
+def visualize_reconstruction(
+    model: nn.Module,
+    dataloader: DataLoader,
+    device: torch.device,
+    epoch: int,
+    vis_dir: Path,
+    num_samples: int = 4,
+) -> None:
+    """
+    Visualize reconstruction comparisons.
+
+    Creates a figure with 3 columns:
+    - Column 1: Original image
+    - Column 2: Masked input
+    - Column 3: Reconstruction
+    """
+    model.eval()
+    vis_dir.mkdir(parents=True, exist_ok=True)
+
+    # Get a batch of samples
+    batch = next(iter(dataloader))
+    images = batch["image"].to(device)
+
+    # Select random samples
+    indices = torch.randperm(images.size(0))[:num_samples]
+    sample_images = images[indices]
+
+    # Generate masks
+    with torch.no_grad():
+        masks = model.random_masking(sample_images, model.mask_ratio)
+        outputs = model(sample_images, mask=masks)
+        reconstructed = outputs['reconstructed']
+        mask = outputs['mask']
+
+    # Convert to numpy for plotting
+    sample_images_np = sample_images.cpu().numpy()
+    masked_images_np = (sample_images * (1 - mask)).cpu().numpy()
+    reconstructed_np = reconstructed.cpu().numpy()
+    mask_np = mask.cpu().numpy()
+
+    # Create figure
+    fig, axes = plt.subplots(num_samples, 3, figsize=(12, 4 * num_samples))
+    if num_samples == 1:
+        axes = axes.reshape(1, -1)
+
+    for i in range(num_samples):
+        # Original
+        axes[i, 0].imshow(sample_images_np[i, 0], cmap='gray', vmin=0, vmax=1)
+        axes[i, 0].set_title('Original')
+        axes[i, 0].axis('off')
+
+        # Masked
+        axes[i, 1].imshow(masked_images_np[i, 0], cmap='gray', vmin=0, vmax=1)
+        axes[i, 1].set_title('Masked Input')
+        axes[i, 1].axis('off')
+
+        # Reconstruction
+        axes[i, 2].imshow(reconstructed_np[i, 0], cmap='gray', vmin=0, vmax=1)
+        axes[i, 2].set_title('Reconstruction')
+        axes[i, 2].axis('off')
+
+    plt.suptitle(f'Epoch {epoch} - Reconstruction Comparison', fontsize=14, fontweight='bold')
+    plt.tight_layout()
+
+    # Save figure
+    save_path = vis_dir / f"mim_recon_epoch_{epoch:02d}.png"
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    print(f"Saved visualization: {save_path}")
+
+    # Display inline for Kaggle/Jupyter
+    plt.show()
+    plt.close()
+
+    model.train()
+
+
+
 def main():
     args = parse_args()
 
@@ -118,9 +236,13 @@ def main():
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 
+    # Create visualization directory
+    vis_dir = Path(args.vis_dir)
+    vis_dir.mkdir(parents=True, exist_ok=True)
+
     # Dataset
     print("Loading dataset...")
-    dataset = SolarFilamentFastDataset(
+    full_dataset = SolarFilamentFastDataset(
         data_root=args.data_root,
         tile_size=args.tile_size,
         stride=args.stride,
@@ -131,15 +253,37 @@ def main():
         in_channels=1,
     )
 
-    dataloader = DataLoader(
-        dataset,
+    # Split into train and validation
+    total_size = len(full_dataset)
+    val_size = int(total_size * args.val_ratio)
+    train_size = total_size - val_size
+
+    # Create train dataset
+    train_dataset, val_dataset = torch.utils.data.random_split(
+        full_dataset,
+        [train_size, val_size],
+        generator=torch.Generator().manual_seed(42),
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=True,
     )
 
-    print(f"Dataset size: {len(dataset)} tiles")
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True,
+    )
+
+    print(f"Total dataset size: {total_size} tiles")
+    print(f"Training dataset size: {train_size} tiles")
+    print(f"Validation dataset size: {val_size} tiles")
 
     # Model
     print("Creating SimMIM model...")
@@ -183,18 +327,19 @@ def main():
 
     # Training loop
     print(f"Starting training for {args.epochs} epochs...")
-    print(f"Total batches per epoch: {len(dataloader)}")
-    print(f"Estimated time per epoch: ~{len(dataloader) / 800:.1f} minutes (at 800 it/s)")
-    print(f"Estimated total time: ~{len(dataloader) * args.epochs / 800 / 60:.1f} hours")
+    print(f"Total batches per epoch: {len(train_loader)}")
+    print(f"Estimated time per epoch: ~{len(train_loader) / 800:.1f} minutes (at 800 it/s)")
+    print(f"Estimated total time: ~{len(train_loader) * args.epochs / 800 / 60:.1f} hours")
     best_loss = float('inf')
 
     for epoch in range(1, args.epochs + 1):
         print(f"\nEpoch {epoch}/{args.epochs}")
         print(f"Learning rate: {scheduler.get_last_lr()[0]:.6f}")
 
+        # Train
         metrics = train_one_epoch(
             model,
-            dataloader,
+            train_loader,
             optimizer,
             scaler,
             device,
@@ -202,6 +347,26 @@ def main():
         )
 
         print(f"Train Loss: {metrics['loss']:.4f}")
+
+        # Validate every val_freq epochs
+        if epoch % args.val_freq == 0:
+            val_metrics = validate(model, val_loader, device)
+            print(f"Val Loss: {val_metrics['loss']:.4f}")
+
+            # Visualize reconstruction
+            visualize_reconstruction(
+                model,
+                val_loader,
+                device,
+                epoch,
+                vis_dir,
+                num_samples=4,
+            )
+            
+            # Update best loss based on validation
+            current_val_loss = val_metrics['loss']
+        else:
+            current_val_loss = metrics['loss']
 
         # Step scheduler after each epoch
         scheduler.step()
@@ -213,20 +378,22 @@ def main():
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'loss': metrics['loss'],
+                'train_loss': metrics['loss'],
+                'val_loss': val_metrics.get('loss', metrics['loss']),
                 'lr': scheduler.get_last_lr()[0],
             }, checkpoint_path)
             print(f"Saved checkpoint: {checkpoint_path}")
 
             # Save best model
-            if metrics['loss'] < best_loss:
-                best_loss = metrics['loss']
+            if current_val_loss < best_loss:
+                best_loss = current_val_loss
                 best_path = save_dir / "simmim_best.pt"
                 torch.save({
                     'epoch': epoch,
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
-                    'loss': metrics['loss'],
+                    'train_loss': metrics['loss'],
+                    'val_loss': current_val_loss,
                 }, best_path)
                 print(f"Saved best model: {best_path}")
 
