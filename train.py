@@ -42,18 +42,18 @@ from src import SolarFilamentFastDataset, SolarFilamentNet, SolarTrainer
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Solar Filament Fast Micro-Segmentation Trainer")
     parser.add_argument("--data_root", type=str, required=True, help="Path to dataset root directory")
-    parser.add_argument("--backbone", type=str, default="resnet34", help="timm backbone model (default: resnet34)")
+    parser.add_argument("--backbone", type=str, default="nvidia/mit-b0", help="Backbone model (default: nvidia/mit-b0 for SegFormer B0 - Mix Transformer for SimMIM)")
     parser.add_argument("--tile_size", type=int, default=512, help="Patch resolution (default: 512)")
-    parser.add_argument("--stride", type=int, default=384, help="Patch stride (default: 384)")
+    parser.add_argument("--stride", type=int, default=512, help="Patch stride (default: 512 - no overlap for training)")
     parser.add_argument("--epochs", type=int, default=50, help="Total training epochs (default: 50)")
-    parser.add_argument("--batch_size", type=int, default=4, help="Batch size per GPU (default: 4)")
+    parser.add_argument("--batch_size", type=int, default=8, help="Batch size per GPU (default: 8)")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate (default: 1e-4)")
     parser.add_argument("--use_amp", action="store_true", default=True, help="Enable AMP FP16 precision (default: True)")
     parser.add_argument("--no_amp", action="store_false", dest="use_amp", help="Disable AMP")
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints", help="Directory for checkpoints")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint .pt to resume from, or 'last'")
     parser.add_argument("--save_interval", type=int, default=1, help="Interval in epochs to save milestone checkpoints")
-    parser.add_argument("--num_workers", type=int, default=2, help="DataLoader worker processes per GPU (default: 2)")
+    parser.add_argument("--num_workers", type=int, default=4, help="DataLoader worker processes per GPU (default: 4)")
     parser.add_argument("--max_val_batches", type=int, default=500, help="Max validation batches per epoch to avoid NCCL timeout (default: 500)")
     return parser.parse_args()
 
@@ -117,10 +117,12 @@ def main() -> None:
     # Validation DataLoader (only master process evaluates to prevent duplicate compute)
     val_loader = None
     if is_master:
+        # Use overlapping stride for validation (384) for better coverage
+        val_stride = 384 if args.stride == 512 else args.stride
         val_dataset = SolarFilamentFastDataset(
             data_root=args.data_root,
             tile_size=args.tile_size,
-            stride=args.stride,
+            stride=val_stride,
             augment=False,
             is_train=False,
         )

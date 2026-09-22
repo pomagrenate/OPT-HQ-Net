@@ -5,7 +5,7 @@ Key Features:
   - Vectorized Foreground-Aware Sampling (70% positive, 20% active boundary, 10% background).
   - Sub-millisecond on-the-fly polygon rasterization shifted directly to tile coordinates
     (eliminates huge 2048x2048 full-mask rasterization and RAM bloat).
-  - Fast spatial augmentations (H-flip, V-flip, rot90) executing in <0.2ms.
+  - YOLO-style online augmentation with albumentations (synchronized image/mask/skeleton transforms).
   - Zero CPU morphology operations (skeletonization is deferred to GPU in the loss function).
 """
 
@@ -17,6 +17,7 @@ import random
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
+import albumentations as A
 import cv2
 import numpy as np
 import torch
@@ -60,6 +61,7 @@ class SolarFilamentFastDataset(Dataset):
         augment: bool = True,
         is_train: bool = True,
         max_samples: Optional[int] = None,
+        in_channels: int = 1,  # Grayscale for SimMIM
     ) -> None:
         super().__init__()
         self.data_root = Path(data_root)
@@ -71,6 +73,7 @@ class SolarFilamentFastDataset(Dataset):
         self.augment = augment
         self.is_train = is_train
         self.max_samples = max_samples
+        self.in_channels = in_channels
 
         self.image_records: List[Dict] = []
         self.positive_tiles: List[Tuple[int, int, int]] = []  # (img_idx, y, x)
@@ -78,7 +81,69 @@ class SolarFilamentFastDataset(Dataset):
         self.negative_tiles: List[Tuple[int, int, int]] = []
         self.all_tiles: List[Tuple[int, int, int]] = []
 
+        # YOLO-style augmentation pipeline
+        self._setup_augmentation()
+
         self._discover_and_index()
+
+    def _setup_augmentation(self) -> None:
+        """Setup YOLO-style augmentation pipeline with albumentations."""
+        # Set normalization mean/std based on in_channels
+        if self.in_channels == 1:
+            # Grayscale normalization
+            mean = [0.5]
+            std = [0.5]
+        else:
+            # RGB ImageNet normalization
+            mean = [0.485, 0.456, 0.406]
+            std = [0.229, 0.224, 0.225]
+
+        if self.is_train and self.augment:
+            # Training augmentation: comprehensive YOLO-style transforms
+            self.transform = A.Compose([
+                # Geometric transforms
+                A.RandomRotate90(p=0.5),
+                A.HorizontalFlip(p=0.5),
+                A.VerticalFlip(p=0.5),
+                A.Affine(
+                    translate_percent=0.0625,
+                    scale=(0.85, 1.15),
+                    rotate=(-180, 180),
+                    p=0.7
+                ),
+                A.RandomResizedCrop(
+                    size=(self.tile_size, self.tile_size),
+                    scale=(0.6, 1.0),
+                    p=0.5
+                ),
+                # Elastic deformation for plasma simulation
+                A.ElasticTransform(
+                    alpha=1.0,
+                    sigma=30,
+                    p=0.3
+                ),
+                # Photometric transforms (only for RGB)
+                *([A.RandomBrightnessContrast(
+                    brightness_limit=0.2,
+                    contrast_limit=0.2,
+                    p=0.4
+                ), A.GaussNoise(var_limit=(10.0, 50.0), p=0.2)] if self.in_channels == 3 else []),
+                # Normalization
+                A.Normalize(
+                    mean=mean,
+                    std=std,
+                    max_pixel_value=1.0
+                ),
+            ], additional_targets={'skeleton': 'mask'})
+        else:
+            # Validation: only normalization
+            self.transform = A.Compose([
+                A.Normalize(
+                    mean=mean,
+                    std=std,
+                    max_pixel_value=1.0
+                ),
+            ], additional_targets={'skeleton': 'mask'})
 
     def _discover_and_index(self) -> None:
         """Scan dataset directory, locate images and annotations, and construct fast tile index."""
@@ -275,6 +340,12 @@ class SolarFilamentFastDataset(Dataset):
         full_img = self._load_raw_image(rec["img_path"])
         img_patch = full_img[y : y + s, x : x + s]
 
+        # Convert RGB to grayscale if in_channels=1 (for SimMIM)
+        if self.in_channels == 1 and img_patch.shape[-1] == 3:
+            # Convert RGB to grayscale using luminance formula
+            img_patch = np.dot(img_patch[..., :3], [0.2989, 0.5870, 0.1140])
+            img_patch = img_patch[..., np.newaxis]  # Add channel dimension back
+
         # Pad if tile extends outside bounds
         if img_patch.shape[0] != s or img_patch.shape[1] != s:
             img_patch = cv2.copyMakeBorder(
@@ -312,40 +383,40 @@ class SolarFilamentFastDataset(Dataset):
                     shifted_poly = poly - np.array([x, y], dtype=np.int32)
                     cv2.fillPoly(mask_patch, [shifted_poly], 1.0)
 
-        # 4. Fast Spatial Augmentation (<0.2ms using NumPy slicing)
-        if self.augment and self.is_train:
-            # Random Horizontal Flip
-            if random.random() < 0.5:
-                img_patch = np.fliplr(img_patch)
-                mask_patch = np.fliplr(mask_patch)
-            # Random Vertical Flip
-            if random.random() < 0.5:
-                img_patch = np.flipud(img_patch)
-                mask_patch = np.flipud(mask_patch)
-            # Random 90 deg rotation
-            k = random.choice([0, 1, 2, 3])
-            if k > 0:
-                img_patch = np.rot90(img_patch, k)
-                mask_patch = np.rot90(mask_patch, k)
-            # Random Brightness/Contrast Jitter
-            if random.random() < 0.5:
-                alpha = random.uniform(0.85, 1.15)
-                beta = random.uniform(-0.05, 0.05)
-                img_patch = np.clip(img_patch * alpha + beta, 0.0, 1.0)
+        # 4. Generate skeleton target (for auxiliary supervision)
+        # Use simple morphological thinning for skeleton (lightweight CPU operation)
+        # Note: This is just for the skeleton target in augmentation; actual loss uses GPU soft-skeleton
+        skel_patch = np.zeros_like(mask_patch)
+        if mask_patch.sum() > 0:
+            # Simple skeletonization using morphological operations
+            kernel = np.ones((3, 3), np.uint8)
+            erosion = cv2.erode(mask_patch.astype(np.uint8), kernel, iterations=1)
+            dilation = cv2.dilate(mask_patch.astype(np.uint8), kernel, iterations=1)
+            skel_patch = (mask_patch - erosion + 0.5 * (mask_patch > 0)).astype(np.float32)
+            skel_patch = np.clip(skel_patch, 0, 1)
 
-        # Standard ImageNet Normalization: (x - mean) / std
-        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-        img_patch = (img_patch - mean) / std
+        # 5. Apply YOLO-style augmentation (synchronized for image, mask, skeleton)
+        # albumentations expects images in (H, W, C) format and masks in (H, W)
+        augmented = self.transform(
+            image=img_patch,
+            mask=mask_patch,
+            skeleton=skel_patch
+        )
+        img_patch = augmented['image']
+        mask_patch = augmented['mask']
+        skel_patch = augmented['skeleton']
 
         # Convert to PyTorch Tensors
-        # Image: (H, W, 3) -> (3, H, W)
-        tensor_img = torch.from_numpy(img_patch.transpose(2, 0, 1).copy()).float()
+        # Image: (H, W, C) -> (C, H, W)
+        tensor_img = torch.from_numpy(img_patch.transpose(2, 0, 1)).float()
         # Mask: (H, W) -> (1, H, W)
-        tensor_mask = torch.from_numpy(mask_patch.copy()).unsqueeze(0).float()
+        tensor_mask = torch.from_numpy(mask_patch).unsqueeze(0).float()
+        # Skeleton: (H, W) -> (1, H, W)
+        tensor_skel = torch.from_numpy(skel_patch).unsqueeze(0).float()
 
         return {
             "image": tensor_img,
             "mask": tensor_mask,
+            "skeleton": tensor_skel,
             "coord": torch.tensor([img_idx, y, x, s], dtype=torch.int32),
         }

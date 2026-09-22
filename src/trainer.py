@@ -359,6 +359,8 @@ class SolarTrainer:
         for batch in pbar:
             images = batch["image"].to(self.device, non_blocking=True)
             masks = batch["mask"].to(self.device, non_blocking=True)
+            # Skeleton target is available but not used in training (GPU soft-skeleton is used in loss)
+            # skeletons = batch.get("skeleton").to(self.device, non_blocking=True) if "skeleton" in batch else None
 
             self.optimizer.zero_grad(set_to_none=True)
 

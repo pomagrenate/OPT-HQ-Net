@@ -154,7 +154,7 @@ class CompoundLoss(nn.Module):
         w_dice: float = 1.0,
         w_cldice: float = 0.5,
         w_skel: float = 0.5,
-        cldice_iters: int = 5,
+        cldice_iters: int = 3,  # Reduced from 5 to 3 for speed
     ) -> None:
         super().__init__()
         self.w_bce = w_bce

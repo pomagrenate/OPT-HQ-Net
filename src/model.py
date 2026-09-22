@@ -2,7 +2,7 @@
 Ultra-Efficient, Lightweight Neural Architecture for Solar Filament Micro-Segmentation.
 
 Architecture:
-  - Backbone: High-throughput timm encoder (ResNet34, ConvNeXt-Nano, or mit_b0)
+  - Backbone: SegFormer B0 from transformers (Mix Transformer for SimMIM)
   - Decoder: Lightweight multi-scale Feature Pyramid Decoder (128 channels)
   - Output: 2-Channel High-Resolution Logits:
       Channel 0: Filament Mask Logits
@@ -13,10 +13,10 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional, Tuple
 
-import timm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from transformers import SegformerForSemanticSegmentation
 
 
 class ConvBlock(nn.Module):
@@ -40,25 +40,24 @@ class ConvBlock(nn.Module):
 
 class SolarFilamentNet(nn.Module):
     """
-    Lightweight, High-Precision Micro-Segmentation Network.
+    Lightweight, High-Precision Micro-Segmentation Network with SegFormer B0.
 
     Parameters
     ----------
     backbone_name : str
-        Encoder model from timm (default: 'resnet34').
-        Options: 'resnet34', 'resnet18', 'convnext_nano', 'mit_b0'.
+        Encoder model (default: 'nvidia/mit-b0' for SegFormer B0).
     in_channels : int
-        Number of input image channels (default: 3).
+        Number of input image channels (default: 1 for grayscale SimMIM).
     decoder_channels : int
         Intermediate feature channels in the decoder (default: 128).
     pretrained : bool
-        Whether to initialize encoder with ImageNet pretrained weights.
+        Whether to initialize encoder with pretrained weights.
     """
 
     def __init__(
         self,
-        backbone_name: str = "resnet34",
-        in_channels: int = 3,
+        backbone_name: str = "nvidia/mit-b0",
+        in_channels: int = 1,
         decoder_channels: int = 128,
         pretrained: bool = True,
     ) -> None:
@@ -66,16 +65,50 @@ class SolarFilamentNet(nn.Module):
         self.backbone_name = backbone_name
         self.in_channels = in_channels
 
-        # Instantiate timm feature extractor
-        self.encoder = timm.create_model(
-            backbone_name,
-            pretrained=pretrained,
-            in_chans=in_channels,
-            features_only=True,
-            out_indices=(1, 2, 3, 4),  # Strides 4, 8, 16, 32
-        )
+        # Instantiate SegFormer from transformers
+        if pretrained:
+            self.encoder = SegformerForSemanticSegmentation.from_pretrained(
+                backbone_name,
+                num_labels=1,  # Will be overridden by custom head
+                ignore_mismatched_sizes=True
+            )
+        else:
+            self.encoder = SegformerForSemanticSegmentation.from_pretrained(
+                backbone_name,
+                num_labels=1,
+                ignore_mismatched_sizes=True
+            )
 
-        enc_channels: List[int] = self.encoder.feature_info.channels()
+        # Modify first layer to accept 1-channel input (grayscale for SimMIM)
+        if in_channels == 1:
+            # Access the first stage's patch embeddings
+            original_proj = self.encoder.segformer.stages[0].patch_embeddings.proj
+            original_weight = original_proj.weight
+            original_out_channels = original_weight.shape[0]
+
+            # Create new conv layer with 1 input channel
+            new_proj = nn.Conv2d(
+                in_channels,
+                original_out_channels,
+                kernel_size=original_proj.kernel_size,
+                stride=original_proj.stride,
+                padding=original_proj.padding,
+                bias=original_proj.bias is not None
+            )
+
+            # Initialize with average of original RGB weights
+            with torch.no_grad():
+                new_proj.weight = nn.Parameter(
+                    original_weight.mean(dim=1, keepdim=True)
+                )
+            if original_proj.bias is not None:
+                new_proj.bias = nn.Parameter(original_proj.bias)
+
+            # Replace the projection layer
+            self.encoder.segformer.stages[0].patch_embeddings.proj = new_proj
+
+        # Get encoder channels: SegFormer B0 has [32, 64, 160, 256]
+        enc_channels = [32, 64, 160, 256]
         c2, c3, c4, c5 = enc_channels
 
         # Lateral 1x1 projections to decoder_channels
@@ -113,9 +146,11 @@ class SolarFilamentNet(nn.Module):
         """
         input_size = (x.shape[-2], x.shape[-1])
 
-        # Multi-scale hierarchical features
-        feats = self.encoder(x)
-        f2, f3, f4, f5 = feats[0], feats[1], feats[2], feats[3]
+        # Get multi-scale features from SegFormer encoder
+        # SegFormer outputs 4 feature maps with channels [32, 64, 160, 256]
+        outputs = self.encoder.segformer(x, output_hidden_states=True)
+        hidden_states = outputs.hidden_states
+        f2, f3, f4, f5 = hidden_states[0], hidden_states[1], hidden_states[2], hidden_states[3]
 
         # Top-down feature pyramid fusion
         p5 = self.lat_c5(f5)
