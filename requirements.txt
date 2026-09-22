@@ -1,6 +1,7 @@
 albucore==0.0.24
 albumentations==2.0.8
 pycocotools>=2.0.0
+tqdm>=4.65.0
 annotated-doc==0.0.5
 annotated-types==0.8.0
 anyio==4.15.1

@@ -11,12 +11,12 @@ import os
 import time
 from pathlib import Path
 from typing import Optional
+from tqdm import tqdm
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from torch.cuda.amp import GradScaler, autocast
 
 from model import MicroFilNet
 from losses import MicroFilNetLoss
@@ -93,7 +93,10 @@ def train_epoch(model: nn.Module, dataloader: DataLoader, criterion: nn.Module,
     
     num_batches = len(dataloader)
     
-    for batch_idx, batch in enumerate(dataloader):
+    # Add progress bar
+    pbar = tqdm(dataloader, desc=f"Epoch {epoch}", leave=False)
+    
+    for batch_idx, batch in enumerate(pbar):
         images = batch['image'].to(device)
         valid_masks = batch['valid_mask'].to(device)
         masks = batch['mask'].to(device)
@@ -128,14 +131,15 @@ def train_epoch(model: nn.Module, dataloader: DataLoader, criterion: nn.Module,
         for key in loss_components:
             loss_components[key] += parts[key].item()
         
-        # Print progress
-        if (batch_idx + 1) % 10 == 0:
-            print(f"Epoch {epoch} [{batch_idx + 1}/{num_batches}] "
-                  f"Loss: {loss.item():.4f} "
-                  f"(BCE: {parts['bce']:.4f}, Dice: {parts['dice']:.4f}, "
-                  f"clDice: {parts['cldice']:.4f}, Bnd: {parts['boundary']:.4f})")
+        # Update progress bar
+        pbar.set_postfix({
+            'loss': f'{loss.item():.4f}',
+            'bce': f'{parts["bce"]:.4f}',
+            'dice': f'{parts["dice"]:.4f}'
+        })
     
     # Average losses
+    pbar.close()
     avg_loss = total_loss / num_batches
     for key in loss_components:
         loss_components[key] /= num_batches
@@ -162,7 +166,9 @@ def validate(model: nn.Module, dataloader: DataLoader, criterion: nn.Module,
     num_batches = len(dataloader)
     
     with torch.no_grad():
-        for batch in dataloader:
+        # Add progress bar for validation
+        pbar = tqdm(dataloader, desc="Validation", leave=False)
+        for batch in pbar:
             images = batch['image'].to(device)
             valid_masks = batch['valid_mask'].to(device)
             masks = batch['mask'].to(device)
@@ -173,8 +179,12 @@ def validate(model: nn.Module, dataloader: DataLoader, criterion: nn.Module,
             total_loss += loss.item()
             for key in loss_components:
                 loss_components[key] += parts[key].item()
+            
+            # Update progress bar
+            pbar.set_postfix({'val_loss': f'{loss.item():.4f}'})
     
     # Average losses
+    pbar.close()
     avg_loss = total_loss / num_batches
     for key in loss_components:
         loss_components[key] /= num_batches
@@ -193,8 +203,18 @@ def main():
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     
     # Set device
-    device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
+    if args.device == 'cuda' and not torch.cuda.is_available():
+        print("CUDA not available, falling back to CPU")
+        device = torch.device('cpu')
+    else:
+        device = torch.device(args.device)
     print(f"Using device: {device}")
+    
+    # Force CUDA if available and requested
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
     
     # Create model
     model = MicroFilNet().to(device)

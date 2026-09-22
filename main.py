@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+from tqdm import tqdm
 
 
 def main():
@@ -114,8 +115,18 @@ Examples:
         from utils import ModelEMA, save_checkpoint, load_checkpoint
         
         # Setup
-        device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
+        if args.device == 'cuda' and not torch.cuda.is_available():
+            print("CUDA not available, falling back to CPU")
+            device = torch.device('cpu')
+        else:
+            device = torch.device(args.device)
         print(f"Using device: {device}")
+        
+        # Force CUDA if available and requested
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
+            print(f"GPU: {torch.cuda.get_device_name(0)}")
+            print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
         
         checkpoint_dir = Path(args.checkpoint_dir)
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -180,7 +191,10 @@ Examples:
             model.train()
             total_loss = 0.0
             
-            for batch_idx, batch in enumerate(train_loader):
+            # Add progress bar
+            pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{args.epochs}", leave=False)
+            
+            for batch_idx, batch in enumerate(pbar):
                 images = batch['image'].to(device)
                 valid_masks = batch['valid_mask'].to(device)
                 masks = batch['mask'].to(device)
@@ -210,10 +224,11 @@ Examples:
                 
                 total_loss += loss.item()
                 
-                if (batch_idx + 1) % 10 == 0:
-                    print(f"  Batch {batch_idx + 1}/{len(train_loader)}: Loss {loss.item():.4f}")
+                # Update progress bar
+                pbar.set_postfix({'loss': f'{loss.item():.4f}'})
             
             avg_loss = total_loss / len(train_loader)
+            pbar.close()
             print(f"Average loss: {avg_loss:.4f}")
             
             scheduler.step()
@@ -251,8 +266,18 @@ Examples:
         from utils import binary_mask_to_rle, create_submission_csv, load_checkpoint
         
         # Setup
-        device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
+        if args.device == 'cuda' and not torch.cuda.is_available():
+            print("CUDA not available, falling back to CPU")
+            device = torch.device('cpu')
+        else:
+            device = torch.device(args.device)
         print(f"Using device: {device}")
+        
+        # Force CUDA if available and requested
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
+            print(f"GPU: {torch.cuda.get_device_name(0)}")
+            print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
         
         # Load model
         model = MicroFilNet().to(device)
@@ -279,13 +304,16 @@ Examples:
         model.eval()
         
         with torch.no_grad():
-            for idx in range(len(test_dataset)):
+            # Add progress bar for inference
+            pbar = tqdm(range(len(test_dataset)), desc="Inference", leave=False)
+            for idx in pbar:
                 sample = test_dataset[idx]
                 image_id = sample['image_id']
                 image = sample['image'].numpy()
                 valid_mask = sample['valid_mask'].numpy()
                 
-                print(f"Processing {image_id} ({idx + 1}/{len(test_dataset)})")
+                pbar.set_postfix({'image': image_id})
+                pbar.update(1)
                 
                 prob_map = tiled_predict(
                     model, image, valid_mask,
@@ -309,8 +337,8 @@ Examples:
                 # Convert to RLE
                 rle_strings = [binary_mask_to_rle(comp) for comp in components]
                 predictions[image_id] = rle_strings
-                
-                print(f"  Found {len(components)} filaments")
+        
+        pbar.close()
         
         # Create submission
         create_submission_csv(predictions, args.output)
