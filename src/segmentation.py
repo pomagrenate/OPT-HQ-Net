@@ -90,12 +90,24 @@ class SolarFilamentSegmentation(nn.Module):
             elif hasattr(self.encoder.segformer, 'encoder'):
                 # Newer version with nested encoder
                 if hasattr(self.encoder.segformer.encoder, 'patch_embeddings'):
-                    original_proj = self.encoder.segformer.encoder.patch_embeddings.proj
-                    self.encoder.segformer.encoder.patch_embeddings.proj = self._create_1ch_conv(original_proj, in_channels)
+                    patch_embeddings = self.encoder.segformer.encoder.patch_embeddings
+                    if isinstance(patch_embeddings, nn.ModuleList):
+                        # ModuleList case - access first element
+                        original_proj = patch_embeddings[0].proj
+                        patch_embeddings[0].proj = self._create_1ch_conv(original_proj, in_channels)
+                    else:
+                        # Single module case
+                        original_proj = patch_embeddings.proj
+                        patch_embeddings.proj = self._create_1ch_conv(original_proj, in_channels)
                 elif hasattr(self.encoder.segformer.encoder, 'embeddings'):
                     # Even newer version
-                    original_proj = self.encoder.segformer.encoder.embeddings.patch_embeddings.proj
-                    self.encoder.segformer.encoder.embeddings.patch_embeddings.proj = self._create_1ch_conv(original_proj, in_channels)
+                    patch_embeddings = self.encoder.segformer.encoder.embeddings.patch_embeddings
+                    if isinstance(patch_embeddings, nn.ModuleList):
+                        original_proj = patch_embeddings[0].proj
+                        patch_embeddings[0].proj = self._create_1ch_conv(original_proj, in_channels)
+                    else:
+                        original_proj = patch_embeddings.proj
+                        patch_embeddings.proj = self._create_1ch_conv(original_proj, in_channels)
             else:
                 # Try to find the first conv layer
                 for name, module in self.encoder.segformer.named_modules():

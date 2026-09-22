@@ -81,31 +81,44 @@ class SolarFilamentNet(nn.Module):
 
         # Modify first layer to accept 1-channel input (grayscale for SimMIM)
         if in_channels == 1:
-            # Access the first stage's patch embeddings
-            original_proj = self.encoder.segformer.stages[0].patch_embeddings.proj
-            original_weight = original_proj.weight
-            original_out_channels = original_weight.shape[0]
-
-            # Create new conv layer with 1 input channel
-            new_proj = nn.Conv2d(
-                in_channels,
-                original_out_channels,
-                kernel_size=original_proj.kernel_size,
-                stride=original_proj.stride,
-                padding=original_proj.padding,
-                bias=original_proj.bias is not None
-            )
-
-            # Initialize with average of original RGB weights
-            with torch.no_grad():
-                new_proj.weight = nn.Parameter(
-                    original_weight.mean(dim=1, keepdim=True)
-                )
-            if original_proj.bias is not None:
-                new_proj.bias = nn.Parameter(original_proj.bias)
-
-            # Replace the projection layer
-            self.encoder.segformer.stages[0].patch_embeddings.proj = new_proj
+            # Handle different transformers versions
+            if hasattr(self.encoder.segformer, 'stages'):
+                # Older version
+                original_proj = self.encoder.segformer.stages[0].patch_embeddings.proj
+                self.encoder.segformer.stages[0].patch_embeddings.proj = self._create_1ch_conv(original_proj, in_channels)
+            elif hasattr(self.encoder.segformer, 'encoder'):
+                # Newer version with nested encoder
+                if hasattr(self.encoder.segformer.encoder, 'patch_embeddings'):
+                    patch_embeddings = self.encoder.segformer.encoder.patch_embeddings
+                    if isinstance(patch_embeddings, nn.ModuleList):
+                        # ModuleList case - access first element
+                        original_proj = patch_embeddings[0].proj
+                        patch_embeddings[0].proj = self._create_1ch_conv(original_proj, in_channels)
+                    else:
+                        # Single module case
+                        original_proj = patch_embeddings.proj
+                        patch_embeddings.proj = self._create_1ch_conv(original_proj, in_channels)
+                elif hasattr(self.encoder.segformer.encoder, 'embeddings'):
+                    # Even newer version
+                    patch_embeddings = self.encoder.segformer.encoder.embeddings.patch_embeddings
+                    if isinstance(patch_embeddings, nn.ModuleList):
+                        original_proj = patch_embeddings[0].proj
+                        patch_embeddings[0].proj = self._create_1ch_conv(original_proj, in_channels)
+                    else:
+                        original_proj = patch_embeddings.proj
+                        patch_embeddings.proj = self._create_1ch_conv(original_proj, in_channels)
+            else:
+                # Try to find the first conv layer
+                for name, module in self.encoder.segformer.named_modules():
+                    if isinstance(module, nn.Conv2d) and module.in_channels == 3:
+                        print(f"Found first conv layer: {name}")
+                        parent_name = '.'.join(name.split('.')[:-1])
+                        parent = self.encoder.segformer
+                        for part in parent_name.split('.'):
+                            parent = getattr(parent, part)
+                        last_name = name.split('.')[-1]
+                        setattr(parent, last_name, self._create_1ch_conv(module, in_channels))
+                        break
 
         # Get encoder channels: SegFormer B0 has [32, 64, 160, 256]
         enc_channels = [32, 64, 160, 256]
@@ -129,6 +142,29 @@ class SolarFilamentNet(nn.Module):
             nn.GELU(),
             nn.Conv2d(64, 2, kernel_size=1),  # Channel 0: Mask, Channel 1: Skeleton
         )
+
+    def _create_1ch_conv(self, original_proj: nn.Conv2d, in_channels: int) -> nn.Conv2d:
+        """Create 1-channel conv from 3-channel conv."""
+        original_weight = original_proj.weight
+        original_out_channels = original_weight.shape[0]
+
+        new_proj = nn.Conv2d(
+            in_channels,
+            original_out_channels,
+            kernel_size=original_proj.kernel_size,
+            stride=original_proj.stride,
+            padding=original_proj.padding,
+            bias=original_proj.bias is not None
+        )
+
+        with torch.no_grad():
+            new_proj.weight = nn.Parameter(
+                original_weight.mean(dim=1, keepdim=True)
+            )
+        if original_proj.bias is not None:
+            new_proj.bias = nn.Parameter(original_proj.bias)
+
+        return new_proj
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
