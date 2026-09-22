@@ -13,6 +13,7 @@ from typing import Dict
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.amp import GradScaler, autocast
@@ -26,62 +27,25 @@ def parse_args():
     parser = argparse.ArgumentParser(description="SimMIM Pre-training")
     parser.add_argument("--data_root", type=str, required=True, help="Path to training data")
     parser.add_argument("--backbone", type=str, default="nvidia/mit-b0", help="Backbone model")
-    parser.add_argument("--batch_size", type=int, default=16, help="Batch size")
-    parser.add_argument("--epochs", type=int, default=100, help="Number of epochs")
+    parser.add_argument("--batch_size", type=int, default=24, help="Batch size (increased for speed)")
+    parser.add_argument("--epochs", type=int, default=35, help="Number of epochs (reduced for Kaggle 12h limit)")
     parser.add_argument("--lr", type=float, default=1.5e-4, help="Learning rate")
     parser.add_argument("--weight_decay", type=float, default=0.05, help="Weight decay")
     parser.add_argument("--mask_ratio", type=float, default=0.5, help="Masking ratio")
     parser.add_argument("--warmup_epochs", type=int, default=5, help="Warmup epochs")
-    parser.add_argument("--num_workers", type=int, default=4, help="DataLoader workers")
+    parser.add_argument("--num_workers", type=int, default=8, help="DataLoader workers (increased for speed)")
     parser.add_argument("--save_dir", type=str, default="checkpoints/simmim", help="Save directory")
-    parser.add_argument("--save_freq", type=int, default=10, help="Save frequency (epochs)")
+    parser.add_argument("--save_freq", type=int, default=5, help="Save frequency (epochs)")
     parser.add_argument("--use_amp", action="store_true", help="Use Automatic Mixed Precision")
     parser.add_argument("--tile_size", type=int, default=512, help="Tile size")
     parser.add_argument("--stride", type=int, default=512, help="Stride for tiling")
     return parser.parse_args()
 
 
-class CosineAnnealingWithWarmup:
-    """Cosine annealing scheduler with linear warmup."""
-
-    def __init__(
-        self,
-        optimizer: optim.Optimizer,
-        warmup_epochs: int,
-        total_epochs: int,
-        base_lr: float,
-        min_lr: float = 1e-6,
-    ) -> None:
-        self.optimizer = optimizer
-        self.warmup_epochs = warmup_epochs
-        self.total_epochs = total_epochs
-        self.base_lr = base_lr
-        self.min_lr = min_lr
-        self.current_epoch = 0
-
-    def step(self) -> None:
-        self.current_epoch += 1
-
-        if self.current_epoch <= self.warmup_epochs:
-            # Linear warmup
-            lr = self.base_lr * self.current_epoch / self.warmup_epochs
-        else:
-            # Cosine annealing
-            progress = (self.current_epoch - self.warmup_epochs) / (self.total_epochs - self.warmup_epochs)
-            lr = self.min_lr + (self.base_lr - self.min_lr) * 0.5 * (1 + torch.cos(torch.tensor(progress * 3.14159)))
-
-        for param_group in self.optimizer.param_groups:
-            param_group['lr'] = lr
-
-    def get_lr(self) -> float:
-        return self.optimizer.param_groups[0]['lr']
-
-
 def train_one_epoch(
     model: nn.Module,
     dataloader: DataLoader,
     optimizer: optim.Optimizer,
-    scheduler: CosineAnnealingWithWarmup,
     scaler: GradScaler | None,
     device: torch.device,
     use_amp: bool,
@@ -133,14 +97,11 @@ def train_one_epoch(
             loss.backward()
             optimizer.step()
 
-        scheduler.step()
-
         total_loss += loss.item() * images.size(0)
         total_samples += images.size(0)
 
         pbar.set_postfix({
             'loss': f"{loss.item():.4f}",
-            'lr': f"{scheduler.get_lr():.6f}"
         })
 
     return {'loss': total_loss / total_samples}
@@ -197,12 +158,24 @@ def main():
         betas=(0.9, 0.999),
     )
 
-    # Scheduler
-    scheduler = CosineAnnealingWithWarmup(
+    # Scheduler - use PyTorch's built-in schedulers
+    # Combined warmup + cosine annealing
+    scheduler = optim.lr_scheduler.SequentialLR(
         optimizer,
-        warmup_epochs=args.warmup_epochs,
-        total_epochs=args.epochs,
-        base_lr=args.lr,
+        schedulers=[
+            optim.lr_scheduler.LinearLR(
+                optimizer,
+                start_factor=0.0,
+                end_factor=1.0,
+                total_iters=args.warmup_epochs,
+            ),
+            optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=args.epochs - args.warmup_epochs,
+                eta_min=1e-6,
+            ),
+        ],
+        milestones=[args.warmup_epochs],
     )
 
     # AMP scaler
@@ -210,23 +183,28 @@ def main():
 
     # Training loop
     print(f"Starting training for {args.epochs} epochs...")
+    print(f"Total batches per epoch: {len(dataloader)}")
+    print(f"Estimated time per epoch: ~{len(dataloader) / 800:.1f} minutes (at 800 it/s)")
+    print(f"Estimated total time: ~{len(dataloader) * args.epochs / 800 / 60:.1f} hours")
     best_loss = float('inf')
 
     for epoch in range(1, args.epochs + 1):
         print(f"\nEpoch {epoch}/{args.epochs}")
-        print(f"Learning rate: {scheduler.get_lr():.6f}")
+        print(f"Learning rate: {scheduler.get_last_lr()[0]:.6f}")
 
         metrics = train_one_epoch(
             model,
             dataloader,
             optimizer,
-            scheduler,
             scaler,
             device,
             args.use_amp,
         )
 
         print(f"Train Loss: {metrics['loss']:.4f}")
+
+        # Step scheduler after each epoch
+        scheduler.step()
 
         # Save checkpoint
         if epoch % args.save_freq == 0 or epoch == args.epochs:
@@ -236,7 +214,7 @@ def main():
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'loss': metrics['loss'],
-                'lr': scheduler.get_lr(),
+                'lr': scheduler.get_last_lr()[0],
             }, checkpoint_path)
             print(f"Saved checkpoint: {checkpoint_path}")
 
