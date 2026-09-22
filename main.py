@@ -13,6 +13,7 @@ Usage:
 from __future__ import annotations
 import argparse
 import sys
+import os
 from pathlib import Path
 from tqdm import tqdm
 
@@ -62,6 +63,8 @@ Examples:
                              help='Use exponential moving average')
     train_parser.add_argument('--device', type=str, default='cuda',
                              help='Device to use (cuda/cpu)')
+    train_parser.add_argument('--num_gpus', type=int, default=2,
+                             help='Number of GPUs to use for DDP training')
     
     # Inference command
     predict_parser = subparsers.add_parser('predict', help='Run inference')
@@ -111,28 +114,48 @@ Examples:
         
         from model import MicroFilNet
         from losses import MicroFilNetLoss
-        from dataset import SolarFilamentDataset, create_dataloaders
+        from dataset import SolarFilamentDataset, create_dataloaders, collate_fn
         from utils import ModelEMA, save_checkpoint, load_checkpoint
         
-        # Setup
-        if args.device == 'cuda' and not torch.cuda.is_available():
-            print("CUDA not available, falling back to CPU")
-            device = torch.device('cpu')
+        # Setup distributed training if multiple GPUs
+        use_ddp = args.num_gpus > 1 and torch.cuda.device_count() >= args.num_gpus
+        if use_ddp:
+            print(f"Using DDP with {args.num_gpus} GPUs")
+            torch.distributed.init_process_group(backend='nccl')
+            local_rank = int(os.environ.get('LOCAL_RANK', 0))
+            torch.cuda.set_device(local_rank)
+            device = torch.device(f'cuda:{local_rank}')
         else:
-            device = torch.device(args.device)
+            if args.device == 'cuda' and not torch.cuda.is_available():
+                print("CUDA not available, falling back to CPU")
+                device = torch.device('cpu')
+            else:
+                device = torch.device(args.device)
+        
         print(f"Using device: {device}")
         
         # Force CUDA if available and requested
         if device.type == 'cuda':
             torch.cuda.empty_cache()
-            print(f"GPU: {torch.cuda.get_device_name(0)}")
-            print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
+            if not use_ddp:
+                print(f"GPU: {torch.cuda.get_device_name(0)}")
+                print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
+            else:
+                for i in range(torch.cuda.device_count()):
+                    print(f"GPU {i}: {torch.cuda.get_device_name(i)} - {torch.cuda.get_device_properties(i).total_memory / 1024**3:.2f} GB")
         
         checkpoint_dir = Path(args.checkpoint_dir)
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         
         # Create model
         model = MicroFilNet().to(device)
+        
+        # Wrap with DDP if using multiple GPUs
+        if use_ddp:
+            model = torch.nn.parallel.DistributedDataParallel(
+                model, device_ids=[local_rank], output_device=local_rank
+            )
+        
         print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
         
         criterion = MicroFilNetLoss()
@@ -173,28 +196,56 @@ Examples:
         
         # Create dataloaders
         print(f"Loading data from: {args.data_root}")
-        train_loader, _ = create_dataloaders(
-            data_root=args.data_root,
-            batch_size=args.batch_size,
-            tile_size=args.tile_size,
-            num_workers=2,  # Enable parallel data loading for better GPU utilization
-            use_cache=args.use_cache
-        )
+        
+        if use_ddp:
+            from torch.utils.data.distributed import DistributedSampler
+            train_dataset = SolarFilamentDataset(
+                data_root=args.data_root,
+                split='train',
+                tile_size=args.tile_size,
+                overlap=args.overlap,
+                use_cache=args.use_cache
+            )
+            train_sampler = DistributedSampler(train_dataset, num_replicas=args.num_gpus, rank=local_rank)
+            train_loader = DataLoader(
+                train_dataset,
+                batch_size=args.batch_size,
+                sampler=train_sampler,
+                num_workers=2,
+                pin_memory=True,
+                collate_fn=collate_fn
+            )
+        else:
+            train_loader, _ = create_dataloaders(
+                data_root=args.data_root,
+                batch_size=args.batch_size,
+                tile_size=args.tile_size,
+                num_workers=2,
+                use_cache=args.use_cache
+            )
         
         print(f"Training batches: {len(train_loader)}")
         
         # Training loop
         for epoch in range(start_epoch, args.epochs):
-            print(f"\nEpoch {epoch + 1}/{args.epochs}")
-            print("-" * 50)
+            if use_ddp:
+                train_sampler.set_epoch(epoch)
+            
+            if not use_ddp or local_rank == 0:
+                print(f"\nEpoch {epoch + 1}/{args.epochs}")
+                print("-" * 50)
             
             model.train()
             total_loss = 0.0
             
-            # Add progress bar
-            pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{args.epochs}", leave=False)
+            # Add progress bar (only on rank 0)
+            if not use_ddp or local_rank == 0:
+                pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{args.epochs}", leave=False)
+                iterator = pbar
+            else:
+                iterator = train_loader
             
-            for batch_idx, batch in enumerate(pbar):
+            for batch_idx, batch in enumerate(iterator):
                 images = batch['image'].to(device)
                 valid_masks = batch['valid_mask'].to(device)
                 masks = batch['mask'].to(device)
@@ -224,23 +275,26 @@ Examples:
                 
                 total_loss += loss.item()
                 
-                # Update progress bar
-                pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+                # Update progress bar (only on rank 0)
+                if not use_ddp or local_rank == 0:
+                    iterator.set_postfix({'loss': f'{loss.item():.4f}'})
             
             avg_loss = total_loss / len(train_loader)
-            pbar.close()
-            print(f"Average loss: {avg_loss:.4f}")
+            if not use_ddp or local_rank == 0:
+                iterator.close()
+                print(f"Average loss: {avg_loss:.4f}")
             
             scheduler.step()
             
-            # Save checkpoints
+            # Save checkpoints (only on rank 0)
             is_best = avg_loss < best_loss
             if is_best:
                 best_loss = avg_loss
             
-            save_checkpoint(model, optimizer, epoch, avg_loss, checkpoint_dir / 'last.pt', ema, scheduler)
-            if is_best:
-                save_checkpoint(model, optimizer, epoch, avg_loss, checkpoint_dir / 'best_model.pt', ema, scheduler)
+            if not use_ddp or local_rank == 0:
+                save_checkpoint(model, optimizer, epoch, avg_loss, checkpoint_dir / 'last.pt', ema, scheduler)
+                if is_best:
+                    save_checkpoint(model, optimizer, epoch, avg_loss, checkpoint_dir / 'best_model.pt', ema, scheduler)
         
         print("\nTraining completed!")
         print(f"Best loss: {best_loss:.4f}")
