@@ -16,6 +16,8 @@ import sys
 import os
 from pathlib import Path
 from tqdm import tqdm
+import matplotlib.pyplot as plt
+import numpy as np
 
 
 def main():
@@ -110,7 +112,14 @@ Examples:
         import torch.nn as nn
         import torch.optim as optim
         from torch.utils.data import DataLoader
-        from torch.cuda.amp import GradScaler, autocast
+        
+        # Import autocast for AMP
+        try:
+            from torch.amp import autocast, GradScaler
+            use_new_amp = True
+        except ImportError:
+            from torch.cuda.amp import autocast, GradScaler
+            use_new_amp = False
         
         from model import MicroFilNet
         from losses import MicroFilNetLoss
@@ -164,7 +173,7 @@ Examples:
         
         ema = ModelEMA(model, decay=0.9999, device=device) if args.use_ema else None
         
-        # Import autocast for AMP
+        # Create gradient scaler for AMP
         try:
             from torch.amp import autocast, GradScaler
             scaler = GradScaler() if args.use_amp else None
@@ -199,14 +208,27 @@ Examples:
         
         if use_ddp:
             from torch.utils.data.distributed import DistributedSampler
-            train_dataset = SolarFilamentDataset(
+            full_dataset = SolarFilamentDataset(
                 data_root=args.data_root,
                 split='train',
                 tile_size=args.tile_size,
                 overlap=args.overlap,
                 use_cache=args.use_cache
             )
+            
+            # Split dataset for train/val
+            dataset_size = len(full_dataset)
+            val_size = int(dataset_size * 0.1)
+            train_size = dataset_size - val_size
+            
+            train_dataset, val_dataset = torch.utils.data.random_split(
+                full_dataset, [train_size, val_size],
+                generator=torch.Generator().manual_seed(42)
+            )
+            
             train_sampler = DistributedSampler(train_dataset, num_replicas=args.num_gpus, rank=local_rank)
+            val_sampler = DistributedSampler(val_dataset, num_replicas=args.num_gpus, rank=local_rank, shuffle=False)
+            
             train_loader = DataLoader(
                 train_dataset,
                 batch_size=args.batch_size,
@@ -215,13 +237,23 @@ Examples:
                 pin_memory=True,
                 collate_fn=collate_fn
             )
+            
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=args.batch_size,
+                sampler=val_sampler,
+                num_workers=2,
+                pin_memory=True,
+                collate_fn=collate_fn
+            )
         else:
-            train_loader, _ = create_dataloaders(
+            train_loader, val_loader = create_dataloaders(
                 data_root=args.data_root,
                 batch_size=args.batch_size,
                 tile_size=args.tile_size,
                 num_workers=2,
-                use_cache=args.use_cache
+                use_cache=args.use_cache,
+                val_split=0.1
             )
         
         print(f"Training batches: {len(train_loader)}")
@@ -282,7 +314,41 @@ Examples:
             avg_loss = total_loss / len(train_loader)
             if not use_ddp or local_rank == 0:
                 iterator.close()
-                print(f"Average loss: {avg_loss:.4f}")
+                print(f"Average train loss: {avg_loss:.4f}")
+            
+            # Validation
+            if val_loader is not None:
+                if not use_ddp or local_rank == 0:
+                    print("Running validation...")
+                
+                model.eval()
+                val_loss = 0.0
+                val_samples = 0
+                
+                with torch.no_grad():
+                    for batch in val_loader:
+                        images = batch['image'].to(device)
+                        valid_masks = batch['valid_mask'].to(device)
+                        masks = batch['mask'].to(device)
+                        
+                        logits = model(images)
+                        loss, parts = criterion(logits, masks, valid_masks, epoch)
+                        
+                        val_loss += loss.item() * images.size(0)
+                        val_samples += images.size(0)
+                
+                avg_val_loss = val_loss / val_samples
+                if not use_ddp or local_rank == 0:
+                    print(f"Average val loss: {avg_val_loss:.4f}")
+                
+                # Use validation loss for best model saving
+                current_loss = avg_val_loss
+                
+                # Create visualization plots
+                if not use_ddp or local_rank == 0:
+                    create_validation_plots(model, val_loader, device, epoch, checkpoint_dir)
+            else:
+                current_loss = avg_loss
             
             scheduler.step()
             
@@ -400,6 +466,58 @@ Examples:
         print(f"\nInference completed!")
         print(f"Total images: {len(predictions)}")
         print(f"Total filaments: {total_filaments}")
+
+
+def create_validation_plots(model, val_loader, device, epoch, checkpoint_dir):
+    """Create visualization plots of original vs segmented images."""
+    model.eval()
+    
+    # Get a few samples from validation
+    samples = []
+    with torch.no_grad():
+        for batch in val_loader:
+            samples.append(batch)
+            if len(samples) >= 2:  # Get 2 batches
+                break
+    
+    # Create plots
+    fig, axes = plt.subplots(2, 4, figsize=(16, 8))
+    fig.suptitle(f'Epoch {epoch + 1} - Validation Results', fontsize=16)
+    
+    sample_idx = 0
+    for batch in samples:
+        images = batch['image'].to(device)
+        masks = batch['mask'].to(device)
+        
+        # Get predictions
+        logits = model(images)
+        probs = torch.sigmoid(logits)
+        preds = (probs > 0.5).float()
+        
+        # Plot first 2 samples from this batch
+        for i in range(min(2, images.size(0))):
+            if sample_idx >= 4:
+                break
+            
+            # Original image (first channel)
+            ax = axes[sample_idx // 2, sample_idx % 2 * 2]
+            ax.imshow(images[i, 0].cpu().numpy(), cmap='gray')
+            ax.set_title('Original')
+            ax.axis('off')
+            
+            # Prediction
+            ax = axes[sample_idx // 2, sample_idx % 2 * 2 + 1]
+            ax.imshow(preds[i, 0].cpu().numpy(), cmap='gray')
+            ax.set_title('Prediction')
+            ax.axis('off')
+            
+            sample_idx += 1
+    
+    plt.tight_layout()
+    plot_path = checkpoint_dir / f'val_epoch_{epoch + 1}.png'
+    plt.savefig(plot_path, dpi=100, bbox_inches='tight')
+    plt.close()
+    print(f"Saved validation plot: {plot_path}")
 
 
 if __name__ == "__main__":

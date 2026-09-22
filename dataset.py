@@ -278,8 +278,8 @@ class SolarFilamentDataset(Dataset):
 
 def create_dataloaders(data_root: str, batch_size: int = 4, 
                       tile_size: int = 256, num_workers: int = 2,
-                      use_cache: bool = True) -> Tuple[torch.utils.data.DataLoader, 
-                                                      Optional[torch.utils.data.DataLoader]]:
+                      use_cache: bool = True, val_split: float = 0.1) -> Tuple[torch.utils.data.DataLoader, 
+                                                                                Optional[torch.utils.data.DataLoader]]:
     """
     Create train and validation dataloaders.
     
@@ -289,15 +289,26 @@ def create_dataloaders(data_root: str, batch_size: int = 4,
         tile_size: Size of tiles for training
         num_workers: Number of worker processes for data loading
         use_cache: Whether to use cached .npy files
+        val_split: Fraction of data to use for validation
         
     Returns:
-        train_loader, val_loader (val_loader is None if no validation split)
+        train_loader, val_loader
     """
-    train_dataset = SolarFilamentDataset(
+    full_dataset = SolarFilamentDataset(
         data_root=data_root,
         split='train',
         tile_size=tile_size,
         use_cache=use_cache
+    )
+    
+    # Split into train and validation
+    dataset_size = len(full_dataset)
+    val_size = int(dataset_size * val_split)
+    train_size = dataset_size - val_size
+    
+    train_dataset, val_dataset = torch.utils.data.random_split(
+        full_dataset, [train_size, val_size],
+        generator=torch.Generator().manual_seed(42)
     )
     
     train_loader = torch.utils.data.DataLoader(
@@ -309,9 +320,16 @@ def create_dataloaders(data_root: str, batch_size: int = 4,
         collate_fn=collate_fn
     )
     
-    # For now, use the same dataset for validation
-    # In practice, you'd want a separate validation split
-    val_loader = None
+    val_loader = torch.utils.data.DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+        collate_fn=collate_fn
+    )
+    
+    print(f"Train samples: {train_size}, Val samples: {val_size}")
     
     return train_loader, val_loader
 

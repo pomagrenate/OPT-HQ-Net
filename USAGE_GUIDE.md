@@ -36,6 +36,11 @@ For Kaggle (GPU-optimized):
 python main.py train --data_root /path/to/MAGFiLO_1.0_Kaggle_2026 --batch_size 4 --tile_size 256
 ```
 
+For Kaggle (Multi-GPU with 2x T4):
+```bash
+torchrun --nproc_per_node=2 main.py train --data_root /path/to/MAGFiLO_1.0_Kaggle_2026 --batch_size 4 --tile_size 256 --num_gpus 2
+```
+
 Or using the standalone training script:
 
 ```bash
