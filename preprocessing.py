@@ -12,6 +12,18 @@ except ImportError:
     _HAS_SKIMAGE = False
 
 
+# NOTE: preprocess_observation() below (radial_flatten + CLAHE + frangi/
+# black-tophat ridge prior) is the strongest preprocessing you have, but
+# nothing currently calls it as part of the training/inference path.
+# dataset.py._read_image / __getitem__ instead do a cheaper on-the-fly
+# percentile-clip + Sobel-gradient ridge, which is weaker (no limb/radial
+# flattening, no CLAHE, no vesselness). If your cached .npy files were built
+# by calling preprocess_observation() offline, that's a real train/inference
+# mismatch vs. any raw-image fallback path. Either (a) write an offline
+# caching script that calls preprocess_observation() to produce the .npy
+# files dataset.py prefers when use_cache=True, or (b) call it directly
+# inside SolarFilamentDataset._read_image for non-.npy inputs so both paths
+# see the same features.
 def load_fits_as_array(path: str) -> np.ndarray:
     from astropy.io import fits
     with fits.open(path) as hdul:
@@ -197,14 +209,31 @@ def class_balanced_sample(
     n: int | None = None,
     rng: np.random.Generator | None = None,
 ) -> list:
+    """Sample `n` tiles, biased toward positives at `positive_ratio`.
+
+    NOTE: for small `n` (in particular the common `n=1` case used for
+    one-tile-per-__getitem__ sampling), `int(n * positive_ratio)` truncates
+    to 0 whenever `n * positive_ratio < 1`, which silently disables the
+    oversampling entirely. We draw `n_pos` from a Binomial(n, positive_ratio)
+    instead, so a single draw still resolves to "positive" with probability
+    `positive_ratio` on average, rather than deterministically to "negative".
+    """
     rng = rng or np.random.default_rng()
     pos = [t for t in tiles if t[3]]
     neg = [t for t in tiles if not t[3]]
     target_n = n or len(tiles)
-    n_pos = int(target_n * positive_ratio)
+
+    if not pos and not neg:
+        return []
+    if not pos:
+        n_pos = 0
+    elif not neg:
+        n_pos = target_n
+    else:
+        n_pos = int(rng.binomial(target_n, positive_ratio))
     n_neg = target_n - n_pos
 
-    if len(pos) == 0:
+    if len(pos) == 0 or n_pos == 0:
         pos_sample = []
         n_neg = target_n
     else:
@@ -212,7 +241,7 @@ def class_balanced_sample(
         pos_indices = rng.choice(len(pos), size=n_pos, replace=replace_pos)
         pos_sample = [pos[i] for i in pos_indices]
 
-    if len(neg) == 0:
+    if len(neg) == 0 or n_neg == 0:
         neg_sample = []
     else:
         replace_neg = len(neg) < n_neg

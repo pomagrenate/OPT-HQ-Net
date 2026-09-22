@@ -57,6 +57,7 @@ class SolarFilamentDataset(Dataset):
 
         self.img_to_polygons: Dict[str, List[List[float]]] = {}
         self.img_dimensions: Dict[str, Tuple[int, int]] = {}
+        self._mask_cache: Dict[str, Optional[np.ndarray]] = {}
         if self.split == 'train':
             self._load_and_index_annotations()
 
@@ -150,6 +151,9 @@ class SolarFilamentDataset(Dataset):
         return arr
 
     def _generate_mask(self, file_name: str, fallback_shape: Tuple[int, int]) -> Optional[np.ndarray]:
+        if file_name in self._mask_cache:
+            return self._mask_cache[file_name]
+
         polygons = self.img_to_polygons.get(file_name)
         if polygons is None:
             polygons = next(
@@ -158,6 +162,7 @@ class SolarFilamentDataset(Dataset):
             )
 
         if not polygons:
+            self._mask_cache[file_name] = None
             return None
 
         h, w = self.img_dimensions.get(file_name, fallback_shape)
@@ -167,7 +172,9 @@ class SolarFilamentDataset(Dataset):
             pts = np.array(poly, dtype=np.int32).reshape(-1, 1, 2)
             cv2.fillPoly(mask, [pts], color=1)
 
-        return mask.astype(np.float32)
+        mask = mask.astype(np.float32)
+        self._mask_cache[file_name] = mask
+        return mask
 
     def _compute_ridge_prior(self, img_01: np.ndarray) -> np.ndarray:
         u8_img = (np.clip(img_01, 0.0, 1.0) * 255.0).astype(np.uint8)

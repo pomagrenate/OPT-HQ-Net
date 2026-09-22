@@ -28,7 +28,7 @@ def rle_to_binary_mask(rle_str: str, height: int, width: int) -> np.ndarray:
     if not rle_str or pd.isna(rle_str):
         return np.zeros((height, width), dtype=np.uint8)
 
-    runs = np.fromstring(rle_str, dtype=int, sep=" ")
+    runs = np.array(rle_str.split(), dtype=int)
     starts = runs[0::2] - 1
     lengths = runs[1::2]
     ends = starts + lengths
