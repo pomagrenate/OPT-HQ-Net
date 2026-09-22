@@ -121,29 +121,6 @@ class SolarFilamentSegmentation(nn.Module):
                         setattr(parent, last_name, self._create_1ch_conv(module, in_channels))
                         break
 
-    def _create_1ch_conv(self, original_proj: nn.Conv2d, in_channels: int) -> nn.Conv2d:
-        """Create 1-channel conv from 3-channel conv."""
-        original_weight = original_proj.weight
-        original_out_channels = original_weight.shape[0]
-
-        new_proj = nn.Conv2d(
-            in_channels,
-            original_out_channels,
-            kernel_size=original_proj.kernel_size,
-            stride=original_proj.stride,
-            padding=original_proj.padding,
-            bias=original_proj.bias is not None
-        )
-
-        with torch.no_grad():
-            new_proj.weight = nn.Parameter(
-                original_weight.mean(dim=1, keepdim=True)
-            )
-        if original_proj.bias is not None:
-            new_proj.bias = nn.Parameter(original_proj.bias)
-
-        return new_proj
-
         # Load SimMIM pre-trained weights if provided
         if simmim_checkpoint is not None:
             self.load_simmim_weights(simmim_checkpoint)
@@ -171,6 +148,29 @@ class SolarFilamentSegmentation(nn.Module):
             nn.GELU(),
             nn.Conv2d(64, 2, kernel_size=1),  # Channel 0: Mask, Channel 1: Skeleton
         )
+
+    def _create_1ch_conv(self, original_proj: nn.Conv2d, in_channels: int) -> nn.Conv2d:
+        """Create 1-channel conv from 3-channel conv."""
+        original_weight = original_proj.weight
+        original_out_channels = original_weight.shape[0]
+
+        new_proj = nn.Conv2d(
+            in_channels,
+            original_out_channels,
+            kernel_size=original_proj.kernel_size,
+            stride=original_proj.stride,
+            padding=original_proj.padding,
+            bias=original_proj.bias is not None
+        )
+
+        with torch.no_grad():
+            new_proj.weight = nn.Parameter(
+                original_weight.mean(dim=1, keepdim=True)
+            )
+        if original_proj.bias is not None:
+            new_proj.bias = nn.Parameter(original_proj.bias)
+
+        return new_proj
 
     def load_simmim_weights(self, checkpoint_path: str) -> None:
         """
