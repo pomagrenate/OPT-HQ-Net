@@ -1,169 +1,307 @@
 """
-train.py — Primary CLI Entrypoint for Ultra-Efficient Solar Filament Micro-Segmentation.
+Training script for MicroFilNet solar filament segmentation.
 
-Supports:
-  - Kaggle 2x GPU DistributedDataParallel (DDP) and clean single-GPU execution.
-  - Automatic Mixed Precision (AMP FP16).
-  - Resuming broken or interrupted training: --resume checkpoints/last.pt
-  - 512x512 tile micro-segmentation with zero CPU bottlenecks.
-
-Usage Examples:
-  # Kaggle Single GPU / Local:
-  python train.py --data_root /path/to/MAGFiLO --batch_size 4 --epochs 50 --use_amp
-
-  # Kaggle 2x GPU with torchrun (Recommended):
-  torchrun --nproc_per_node=2 train.py --data_root /path/to/MAGFiLO --batch_size 4 --epochs 50 --use_amp
-
-  # Resume training after timeout or interruption:
-  python train.py --data_root /path/to/MAGFiLO --resume checkpoints/last.pt --epochs 50
+Usage:
+    python train.py --data_root /path/to/MAGFiLO_1.0_Kaggle_2026/train --epochs 50 --batch_size 4
 """
 
 from __future__ import annotations
-
 import argparse
 import os
-import sys
+import time
 from pathlib import Path
-
-if sys.stdout and hasattr(sys.stdout, "reconfigure"):
-    try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
+from typing import Optional
 
 import torch
-import torch.distributed as dist
+import torch.nn as nn
+import torch.optim as optim
 from torch.utils.data import DataLoader
-from torch.utils.data.distributed import DistributedSampler
+from torch.cuda.amp import GradScaler, autocast
 
-from src import SolarFilamentFastDataset, SolarFilamentNet, SolarTrainer
+from model import MicroFilNet
+from losses import MicroFilNetLoss
+from dataset import SolarFilamentDataset, create_dataloaders
+from utils import ModelEMA, save_checkpoint, load_checkpoint
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Solar Filament Fast Micro-Segmentation Trainer")
-    parser.add_argument("--data_root", type=str, required=True, help="Path to dataset root directory")
-    parser.add_argument("--backbone", type=str, default="nvidia/mit-b0", help="Backbone model (default: nvidia/mit-b0 for SegFormer B0 - Mix Transformer for SimMIM)")
-    parser.add_argument("--tile_size", type=int, default=512, help="Patch resolution (default: 512)")
-    parser.add_argument("--stride", type=int, default=512, help="Patch stride (default: 512 - no overlap for training)")
-    parser.add_argument("--epochs", type=int, default=50, help="Total training epochs (default: 50)")
-    parser.add_argument("--batch_size", type=int, default=8, help="Batch size per GPU (default: 8)")
-    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate (default: 1e-4)")
-    parser.add_argument("--use_amp", action="store_true", default=True, help="Enable AMP FP16 precision (default: True)")
-    parser.add_argument("--no_amp", action="store_false", dest="use_amp", help="Disable AMP")
-    parser.add_argument("--checkpoint_dir", type=str, default="checkpoints", help="Directory for checkpoints")
-    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint .pt to resume from, or 'last'")
-    parser.add_argument("--save_interval", type=int, default=1, help="Interval in epochs to save milestone checkpoints")
-    parser.add_argument("--num_workers", type=int, default=4, help="DataLoader worker processes per GPU (default: 4)")
-    parser.add_argument("--max_val_batches", type=int, default=500, help="Max validation batches per epoch to avoid NCCL timeout (default: 500)")
+def parse_args():
+    parser = argparse.ArgumentParser(description='Train MicroFilNet for solar filament segmentation')
+    
+    # Data arguments
+    parser.add_argument('--data_root', type=str, required=True,
+                       help='Path to the training data directory')
+    parser.add_argument('--use_cache', action='store_true', default=True,
+                       help='Use cached .npy files if available')
+    
+    # Model arguments
+    parser.add_argument('--tile_size', type=int, default=256,
+                       help='Tile size for training patches')
+    parser.add_argument('--overlap', type=float, default=0.25,
+                       help='Overlap fraction for tiling')
+    
+    # Training arguments
+    parser.add_argument('--batch_size', type=int, default=4,
+                       help='Batch size for training')
+    parser.add_argument('--epochs', type=int, default=50,
+                       help='Number of training epochs')
+    parser.add_argument('--lr', type=float, default=1e-4,
+                       help='Learning rate')
+    parser.add_argument('--weight_decay', type=float, default=1e-5,
+                       help='Weight decay')
+    
+    # Training options
+    parser.add_argument('--use_amp', action='store_true',
+                       help='Use automatic mixed precision training')
+    parser.add_argument('--num_workers', type=int, default=2,
+                       help='Number of data loading workers')
+    
+    # Checkpointing
+    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints',
+                       help='Directory to save checkpoints')
+    parser.add_argument('--resume', type=str, default=None,
+                       help='Path to checkpoint to resume from (or "last" for latest)')
+    parser.add_argument('--save_interval', type=int, default=5,
+                       help='Save checkpoint every N epochs')
+    
+    # Device
+    parser.add_argument('--device', type=str, default='cuda',
+                       help='Device to use (cuda/cpu)')
+    
+    # EMA
+    parser.add_argument('--use_ema', action='store_true',
+                       help='Use exponential moving average of model weights')
+    parser.add_argument('--ema_decay', type=float, default=0.9999,
+                       help='EMA decay rate')
+    
     return parser.parse_args()
 
 
-def init_ddp() -> Tuple[int, int, bool]:
-    """Initialize torch.distributed if running in DDP environment (e.g. torchrun)."""
-    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-        rank = int(os.environ["RANK"])
-        world_size = int(os.environ["WORLD_SIZE"])
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        torch.cuda.set_device(local_rank)
-        dist.init_process_group(backend="nccl" if torch.cuda.is_available() else "gloo")
-        return rank, world_size, True
-    return 0, 1, False
+def train_epoch(model: nn.Module, dataloader: DataLoader, criterion: nn.Module,
+                optimizer: optim.Optimizer, device: str, epoch: int,
+                use_amp: bool = False, scaler: Optional[GradScaler] = None,
+                ema: Optional[ModelEMA] = None) -> dict:
+    """Train for one epoch."""
+    model.train()
+    
+    total_loss = 0.0
+    loss_components = {
+        'bce': 0.0,
+        'dice': 0.0,
+        'cldice': 0.0,
+        'boundary': 0.0
+    }
+    
+    num_batches = len(dataloader)
+    
+    for batch_idx, batch in enumerate(dataloader):
+        images = batch['image'].to(device)
+        valid_masks = batch['valid_mask'].to(device)
+        masks = batch['mask'].to(device)
+        
+        optimizer.zero_grad()
+        
+        if use_amp:
+            with autocast():
+                logits = model(images)
+                loss, parts = criterion(logits, masks, valid_masks, epoch)
+            
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            logits = model(images)
+            loss, parts = criterion(logits, masks, valid_masks, epoch)
+            loss.backward()
+            optimizer.step()
+        
+        # Update EMA if enabled
+        if ema is not None:
+            ema.update()
+        
+        # Accumulate losses
+        total_loss += loss.item()
+        for key in loss_components:
+            loss_components[key] += parts[key].item()
+        
+        # Print progress
+        if (batch_idx + 1) % 10 == 0:
+            print(f"Epoch {epoch} [{batch_idx + 1}/{num_batches}] "
+                  f"Loss: {loss.item():.4f} "
+                  f"(BCE: {parts['bce']:.4f}, Dice: {parts['dice']:.4f}, "
+                  f"clDice: {parts['cldice']:.4f}, Bnd: {parts['boundary']:.4f})")
+    
+    # Average losses
+    avg_loss = total_loss / num_batches
+    for key in loss_components:
+        loss_components[key] /= num_batches
+    
+    return {
+        'total_loss': avg_loss,
+        **loss_components
+    }
 
 
-def main() -> None:
+def validate(model: nn.Module, dataloader: DataLoader, criterion: nn.Module,
+             device: str, epoch: int) -> dict:
+    """Validate the model."""
+    model.eval()
+    
+    total_loss = 0.0
+    loss_components = {
+        'bce': 0.0,
+        'dice': 0.0,
+        'cldice': 0.0,
+        'boundary': 0.0
+    }
+    
+    num_batches = len(dataloader)
+    
+    with torch.no_grad():
+        for batch in dataloader:
+            images = batch['image'].to(device)
+            valid_masks = batch['valid_mask'].to(device)
+            masks = batch['mask'].to(device)
+            
+            logits = model(images)
+            loss, parts = criterion(logits, masks, valid_masks, epoch)
+            
+            total_loss += loss.item()
+            for key in loss_components:
+                loss_components[key] += parts[key].item()
+    
+    # Average losses
+    avg_loss = total_loss / num_batches
+    for key in loss_components:
+        loss_components[key] /= num_batches
+    
+    return {
+        'total_loss': avg_loss,
+        **loss_components
+    }
+
+
+def main():
     args = parse_args()
-    rank, world_size, is_ddp = init_ddp()
-    is_master = (rank == 0)
-
-    if is_master:
-        print("\n========================================================")
-        print("   SOLAR FILAMENT MICRO-SEGMENTATION FRAMEWORK (v2.0)   ")
-        print("========================================================")
-        print(f" Data Root     : {args.data_root}")
-        print(f" Backbone      : {args.backbone}")
-        print(f" Tile Resolution: {args.tile_size}x{args.tile_size} (Stride: {args.stride})")
-        print(f" Batch Size    : {args.batch_size} per GPU (Total: {args.batch_size * world_size})")
-        print(f" Target Epochs : {args.epochs}")
-        print(f" AMP Enabled   : {args.use_amp}")
-        print(f" Resuming From : {args.resume or 'None (Training from Scratch)'}")
-        print(f" DDP Active    : {is_ddp} (World Size: {world_size})")
-        print(f" Checkpoint Dir: {args.checkpoint_dir}")
-        print("========================================================\n")
-
-    # 1. Dataset & DataLoaders
-    train_dataset = SolarFilamentFastDataset(
+    
+    # Create checkpoint directory
+    checkpoint_dir = Path(args.checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Set device
+    device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
+    # Create model
+    model = MicroFilNet().to(device)
+    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+    
+    # Create loss function
+    criterion = MicroFilNetLoss()
+    
+    # Create optimizer
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    
+    # Create scheduler
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    
+    # Create EMA if enabled
+    ema = None
+    if args.use_ema:
+        ema = ModelEMA(model, decay=args.ema_decay, device=device)
+    
+    # Create gradient scaler for AMP
+    scaler = None
+    if args.use_amp:
+        scaler = GradScaler()
+    
+    # Load checkpoint if resuming
+    start_epoch = 0
+    best_loss = float('inf')
+    
+    if args.resume:
+        if args.resume == 'last':
+            # Find the most recent checkpoint
+            checkpoints = list(checkpoint_dir.glob('checkpoint_*.pt'))
+            if checkpoints:
+                checkpoint_path = max(checkpoints, key=os.path.getctime)
+            else:
+                checkpoint_path = checkpoint_dir / 'last.pt'
+        else:
+            checkpoint_path = Path(args.resume)
+        
+        if checkpoint_path.exists():
+            info = load_checkpoint(
+                checkpoint_path, model, optimizer, ema, scheduler, device
+            )
+            start_epoch = info['epoch'] + 1
+            best_loss = info['loss']
+            print(f"Resumed from epoch {start_epoch}")
+        else:
+            print(f"Checkpoint not found: {checkpoint_path}")
+    
+    # Create dataloaders
+    print(f"Loading data from: {args.data_root}")
+    train_loader, val_loader = create_dataloaders(
         data_root=args.data_root,
-        tile_size=args.tile_size,
-        stride=args.stride,
-        fg_ratio=0.70,
-        bnd_ratio=0.20,
-        augment=True,
-        is_train=True,
-    )
-
-    sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True) if is_ddp else None
-
-    train_loader = DataLoader(
-        train_dataset,
         batch_size=args.batch_size,
-        shuffle=(sampler is None),
-        sampler=sampler,
+        tile_size=args.tile_size,
         num_workers=args.num_workers,
-        pin_memory=torch.cuda.is_available(),
-        persistent_workers=(args.num_workers > 0),
-        drop_last=True,
+        use_cache=args.use_cache
     )
-
-    # Validation DataLoader (only master process evaluates to prevent duplicate compute)
-    val_loader = None
-    if is_master:
-        # Use overlapping stride for validation (384) for better coverage
-        val_stride = 384 if args.stride == 512 else args.stride
-        val_dataset = SolarFilamentFastDataset(
-            data_root=args.data_root,
-            tile_size=args.tile_size,
-            stride=val_stride,
-            augment=False,
-            is_train=False,
+    
+    print(f"Training batches: {len(train_loader)}")
+    
+    # Training loop
+    for epoch in range(start_epoch, args.epochs):
+        print(f"\nEpoch {epoch + 1}/{args.epochs}")
+        print("-" * 50)
+        
+        # Train
+        train_metrics = train_epoch(
+            model, train_loader, criterion, optimizer, device, epoch,
+            use_amp=args.use_amp, scaler=scaler, ema=ema
         )
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=args.batch_size,
-            shuffle=False,
-            num_workers=args.num_workers,
-            pin_memory=torch.cuda.is_available(),
+        
+        print(f"Train Loss: {train_metrics['total_loss']:.4f}")
+        
+        # Validate if validation loader is available
+        if val_loader is not None:
+            val_metrics = validate(model, val_loader, criterion, device, epoch)
+            print(f"Val Loss: {val_metrics['total_loss']:.4f}")
+            current_loss = val_metrics['total_loss']
+        else:
+            current_loss = train_metrics['total_loss']
+        
+        # Update learning rate
+        scheduler.step()
+        
+        # Save checkpoints
+        is_best = current_loss < best_loss
+        if is_best:
+            best_loss = current_loss
+        
+        # Save last checkpoint
+        save_checkpoint(
+            model, optimizer, epoch, current_loss,
+            checkpoint_dir / 'last.pt', ema, scheduler
         )
-
-    # 2. Model & Optimizer
-    model = SolarFilamentNet(
-        backbone_name=args.backbone,
-        in_channels=3,
-        decoder_channels=128,
-        pretrained=True,
-    )
-
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-
-    # 3. Trainer
-    trainer = SolarTrainer(
-        model=model,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        optimizer=optimizer,
-        epochs=args.epochs,
-        use_amp=args.use_amp,
-        checkpoint_dir=args.checkpoint_dir,
-        resume=args.resume,
-        save_interval=args.save_interval,
-        rank=rank,
-        world_size=world_size,
-        max_val_batches=args.max_val_batches,
-    )
-
-    trainer.train()
-
-    if is_ddp:
-        dist.destroy_process_group()
+        
+        # Save best model
+        if is_best:
+            save_checkpoint(
+                model, optimizer, epoch, current_loss,
+                checkpoint_dir / 'best_model.pt', ema, scheduler
+            )
+        
+        # Save periodic checkpoint
+        if (epoch + 1) % args.save_interval == 0:
+            save_checkpoint(
+                model, optimizer, epoch, current_loss,
+                checkpoint_dir / f'checkpoint_epoch_{epoch + 1}.pt', ema, scheduler
+            )
+    
+    print("\nTraining completed!")
+    print(f"Best loss: {best_loss:.4f}")
 
 
 if __name__ == "__main__":

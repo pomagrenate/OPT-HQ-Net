@@ -1,135 +1,206 @@
 """
-predict.py — High-Throughput Inference & Kaggle Submission Generator.
+Inference script for MicroFilNet solar filament segmentation.
 
 Usage:
-  python predict.py \
-    --weights checkpoints/best_model.pt \
-    --data_root filament-segmentation-2026/MAGFiLO_1.0_Kaggle_2026/test \
-    --output submission.csv \
-    --save_masks output_masks
+    python predict.py --weights checkpoints/best_model.pt --data_root /path/to/test/data --output submission.csv
 """
 
 from __future__ import annotations
-
 import argparse
-import sys
 from pathlib import Path
-
-if sys.stdout and hasattr(sys.stdout, "reconfigure"):
-    try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
-
-import cv2
+from typing import List, Tuple
 import numpy as np
-import pandas as pd
 import torch
-from tqdm import tqdm
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from PIL import Image
+import cv2
 
-from src import FastPatchInferer, SolarFilamentNet, binary_mask_to_rle
+from model import MicroFilNet
+from dataset import SolarFilamentDataset
+from inference import tiled_predict, postprocess_mask
+from utils import binary_mask_to_rle, create_submission_csv, load_checkpoint
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Solar Filament Fast Inference & Kaggle Submission Generator")
-    parser.add_argument("--weights", type=str, required=True, help="Path to trained checkpoint (.pt)")
-    parser.add_argument("--data_root", type=str, required=True, help="Path to test images directory")
-    parser.add_argument("--output", type=str, default="submission.csv", help="Path for output submission CSV")
-    parser.add_argument("--save_masks", type=str, default=None, help="Optional directory to save predicted mask PNGs")
-    parser.add_argument("--backbone", type=str, default="resnet34", help="Encoder backbone name (default: resnet34)")
-    parser.add_argument("--tile_size", type=int, default=512, help="Patch resolution (default: 512)")
-    parser.add_argument("--stride", type=int, default=384, help="Patch stride (default: 384)")
-    parser.add_argument("--threshold", type=float, default=0.50, help="Binarization probability threshold (default: 0.50)")
-    parser.add_argument("--min_area", type=int, default=50, help="Minimum pixel area for connected filament instances")
+def parse_args():
+    parser = argparse.ArgumentParser(description='Run inference with MicroFilNet')
+    
+    # Model weights
+    parser.add_argument('--weights', type=str, required=True,
+                       help='Path to model weights checkpoint')
+    
+    # Data arguments
+    parser.add_argument('--data_root', type=str, required=True,
+                       help='Path to the test data directory')
+    parser.add_argument('--use_cache', action='store_true', default=True,
+                       help='Use cached .npy files if available')
+    
+    # Inference parameters
+    parser.add_argument('--tile_size', type=int, default=256,
+                       help='Tile size for inference')
+    parser.add_argument('--overlap', type=float, default=0.25,
+                       help='Overlap fraction for tiling')
+    parser.add_argument('--threshold', type=float, default=0.5,
+                       help='Probability threshold for binary mask')
+    parser.add_argument('--min_area', type=int, default=30,
+                       help='Minimum area for connected components')
+    parser.add_argument('--close_kernel', type=int, default=3,
+                       help='Kernel size for morphological closing')
+    
+    # Output
+    parser.add_argument('--output', type=str, default='submission.csv',
+                       help='Output CSV file path')
+    
+    # Device
+    parser.add_argument('--device', type=str, default='cuda',
+                       help='Device to use (cuda/cpu)')
+    
+    # Batch size
+    parser.add_argument('--batch_size', type=int, default=8,
+                       help='Batch size for tile inference')
+    
     return parser.parse_args()
 
 
-def main() -> None:
+def extract_connected_components(mask: np.ndarray, min_area: int = 30) -> List[np.ndarray]:
+    """
+    Extract individual connected components from binary mask.
+    
+    Args:
+        mask: Binary mask (H, W)
+        min_area: Minimum area threshold for components
+        
+    Returns:
+        List of binary masks, one for each component
+    """
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    
+    components = []
+    for lbl in range(1, n_labels):
+        area = stats[lbl, cv2.CC_STAT_AREA]
+        if area >= min_area:
+            component = (labels == lbl).astype(np.uint8)
+            components.append(component)
+    
+    return components
+
+
+def run_inference(model: nn.Module, dataset: SolarFilamentDataset, 
+                  device: str, tile_size: int = 256, overlap: float = 0.25,
+                  threshold: float = 0.5, min_area: int = 30,
+                  close_kernel: int = 3, batch_size: int = 8) -> dict:
+    """
+    Run inference on dataset and generate predictions.
+    
+    Args:
+        model: Trained model
+        dataset: Test dataset
+        device: Device to run inference on
+        tile_size: Tile size for sliding window
+        overlap: Overlap fraction
+        threshold: Probability threshold
+        min_area: Minimum component area
+        close_kernel: Morphological closing kernel size
+        batch_size: Batch size for tile inference
+        
+    Returns:
+        Dictionary mapping image_id to list of RLE strings
+    """
+    model.eval()
+    predictions = {}
+    
+    with torch.no_grad():
+        for idx in range(len(dataset)):
+            sample = dataset[idx]
+            image_id = sample['image_id']
+            image = sample['image'].numpy()  # (2, H, W)
+            valid_mask = sample['valid_mask'].numpy()  # (1, H, W)
+            
+            print(f"Processing {image_id} ({idx + 1}/{len(dataset)})")
+            
+            # Run tiled prediction
+            prob_map = tiled_predict(
+                model, image, valid_mask,
+                tile=tile_size, overlap=overlap, device=device,
+                batch_size=batch_size
+            )
+            
+            # Postprocess
+            binary_mask = postprocess_mask(
+                prob_map, threshold=threshold,
+                close_kernel_px=close_kernel, min_area_px=min_area
+            )
+            
+            binary_mask = result['mask']
+            
+            # Extract connected components (individual filaments)
+            components = extract_connected_components(binary_mask, min_area=min_area)
+            
+            # Convert each component to RLE
+            rle_strings = []
+            for component in components:
+                rle = binary_mask_to_rle(component)
+                rle_strings.append(rle)
+            
+            predictions[image_id] = rle_strings
+            
+            print(f"  Found {len(components)} filaments")
+    
+    return predictions
+
+
+def main():
     args = parse_args()
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    print("\n========================================================")
-    print("   SOLAR FILAMENT HIGH-THROUGHPUT INFERENCE PIPELINE    ")
-    print("========================================================")
-    print(f" Weights       : {args.weights}")
-    print(f" Test Data     : {args.data_root}")
-    print(f" Device        : {device}")
-    print(f" Threshold     : {args.threshold}")
-    print(f" Output CSV    : {args.output}")
-    print("========================================================\n")
-
-    # 1. Build Model & Load Weights
-    model = SolarFilamentNet(backbone_name=args.backbone, in_channels=3, decoder_channels=128, pretrained=False)
-    ckpt = torch.load(args.weights, map_location=device)
-    if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
-        state_dict = ckpt["model_state_dict"]
-    elif isinstance(ckpt, dict):
-        state_dict = ckpt
+    
+    # Set device
+    device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
+    # Load model
+    print(f"Loading model from: {args.weights}")
+    model = MicroFilNet().to(device)
+    
+    # Load checkpoint
+    checkpoint_path = Path(args.weights)
+    if checkpoint_path.exists():
+        load_checkpoint(checkpoint_path, model, device=device)
     else:
-        raise ValueError(f"Unrecognized checkpoint format in '{args.weights}'")
-
-    model.load_state_dict(state_dict)
-    model.to(device).eval()
-
-    inferer = FastPatchInferer(
-        model=model,
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    
+    # Create test dataset
+    print(f"Loading test data from: {args.data_root}")
+    test_dataset = SolarFilamentDataset(
+        data_root=args.data_root,
+        split='test',
         tile_size=args.tile_size,
-        stride=args.stride,
-        device=device,
-        batch_size=25,
+        overlap=args.overlap,
+        use_cache=args.use_cache
     )
-
-    # 2. Discover Test Images
-    test_dir = Path(args.data_root)
-    valid_exts = (".png", ".jpg", ".jpeg", ".tif", ".tiff")
-    img_files = sorted([p for p in test_dir.rglob("*") if p.suffix.lower() in valid_exts])
-    if not img_files:
-        raise FileNotFoundError(f"No image files found in '{args.data_root}'")
-
-    print(f"Found {len(img_files)} test images to process.")
-
-    if args.save_masks:
-        out_mask_dir = Path(args.save_masks)
-        out_mask_dir.mkdir(parents=True, exist_ok=True)
-    else:
-        out_mask_dir = None
-
-    # 3. Process Images & Generate RLE Submissions
-    records = []
-
-    for img_path in tqdm(img_files, desc="Running Inference"):
-        base_id = img_path.stem
-        res = inferer.predict(img_path, threshold=args.threshold, use_amp=True)
-        bin_mask = res["binary_mask"]
-
-        if out_mask_dir is not None:
-            cv2.imwrite(str(out_mask_dir / f"{base_id}_pred.png"), bin_mask * 255)
-
-        # Instance Separation via connected components
-        num_labels, labels = cv2.connectedComponents(bin_mask)
-
-        inst_count = 0
-        for label_idx in range(1, num_labels):
-            inst_mask = (labels == label_idx).astype(np.uint8)
-            if inst_mask.sum() >= args.min_area:
-                inst_count += 1
-                rle_str = binary_mask_to_rle(inst_mask)
-                records.append({
-                    "filament_id": f"{base_id}_{inst_count}",
-                    "segmentation_rle": rle_str,
-                })
-
-        # If no instances met the threshold, append empty record to guarantee coverage
-        if inst_count == 0:
-            records.append({
-                "filament_id": f"{base_id}_1",
-                "segmentation_rle": "",
-            })
-
-    # 4. Save CSV
-    df = pd.DataFrame(records)
-    df.to_csv(args.output, index=False)
-    print(f"\n[Success] Generated submission with {len(df)} predictions saved to '{args.output}'")
+    
+    print(f"Test images: {len(test_dataset)}")
+    
+    # Run inference
+    print("\nRunning inference...")
+    predictions = run_inference(
+        model, test_dataset, device,
+        tile_size=args.tile_size,
+        overlap=args.overlap,
+        threshold=args.threshold,
+        min_area=args.min_area,
+        close_kernel=args.close_kernel,
+        batch_size=args.batch_size
+    )
+    
+    # Create submission CSV
+    print(f"\nCreating submission CSV: {args.output}")
+    create_submission_csv(predictions, args.output)
+    
+    # Print summary
+    total_filaments = sum(len(rles) for rles in predictions.values())
+    print(f"\nInference completed!")
+    print(f"Total images processed: {len(predictions)}")
+    print(f"Total filaments detected: {total_filaments}")
+    print(f"Average filaments per image: {total_filaments / len(predictions):.2f}")
 
 
 if __name__ == "__main__":
