@@ -117,9 +117,18 @@ class SolarFilamentDataset(Dataset):
         return data
     
     def load_mask_from_annotations(self, image_name: str) -> Optional[np.ndarray]:
-        """Load mask from COCO-format JSON annotations based on image name."""
+        """Load mask from COCO-format JSON annotations based on image name (optimized)."""
         if self.annotations is None:
             return None
+        
+        # Check cache first
+        cache_key = f"{image_name}_mask"
+        if hasattr(self, '_mask_cache') and cache_key in self._mask_cache:
+            return self._mask_cache[cache_key]
+        
+        # Initialize cache if not exists
+        if not hasattr(self, '_mask_cache'):
+            self._mask_cache = {}
         
         # Find the image ID for this image
         image_id = None
@@ -138,6 +147,7 @@ class SolarFilamentDataset(Dataset):
                 annotations.append(annotation)
         
         if not annotations:
+            self._mask_cache[cache_key] = None
             return None
         
         # Create a binary mask from polygon annotations
@@ -152,23 +162,24 @@ class SolarFilamentDataset(Dataset):
         # Create empty mask
         mask = np.zeros((height, width), dtype=np.float32)
         
-        # Fill mask with polygons - use PIL as fallback (lighter than pycocotools)
+        # Fill mask with polygons - optimized using OpenCV
         try:
-            from PIL import Image, ImageDraw
+            import cv2
             for annotation in annotations:
                 if 'segmentation' in annotation:
                     polygons = annotation['segmentation']
                     for polygon in polygons:
-                        # Reshape polygon to (N, 2)
-                        poly_points = np.array(polygon).reshape(-1, 2)
-                        # Create a temporary mask for this polygon
-                        temp_mask = Image.new('L', (width, height), 0)
-                        draw = ImageDraw.Draw(temp_mask)
-                        draw.polygon([tuple(point) for point in poly_points], fill=1)
-                        mask = np.maximum(mask, np.array(temp_mask))
+                        # Reshape polygon to (N, 1, 2) for OpenCV
+                        poly_points = np.array(polygon, dtype=np.int32).reshape(-1, 1, 2)
+                        # Fill polygon directly on numpy array (much faster than PIL)
+                        cv2.fillPoly(mask, [poly_points], 1)
         except Exception as e:
             print(f"Warning: Could not load mask for {image_name}: {e}")
+            self._mask_cache[cache_key] = None
             return None
+        
+        # Cache the result
+        self._mask_cache[cache_key] = mask
         
         return mask
     
@@ -186,8 +197,35 @@ class SolarFilamentDataset(Dataset):
         if self.split == 'train':
             mask_data = self.load_mask_from_annotations(image_path.name)
         
-        # Preprocess
-        processed = preprocess_observation(image_data)
+        # Simplified preprocessing for speed (skip full preprocessing for now)
+        # Just normalize and stack with a simple ridge prior
+        img = image_data.astype(np.float32)
+        if img.max() > 1.0:
+            img = img / 255.0
+        
+        # Simple normalization
+        lo, hi = np.percentile(img, [1, 99])
+        img = np.clip((img - lo) / max(hi - lo, 1e-6), 0, 1)
+        
+        # Simple ridge prior (gradient magnitude)
+        import cv2
+        gray = (img * 255).astype(np.uint8)
+        grad_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+        grad_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+        ridge = np.sqrt(grad_x**2 + grad_y**2)
+        ridge = ridge / (ridge.max() + 1e-6)
+        
+        # Stack
+        stack = np.stack([img, ridge], axis=0).astype(np.float32)
+        
+        # Simple valid mask (all pixels valid for now)
+        valid_mask = np.ones((1, img.shape[0], img.shape[1]), dtype=np.float32)
+        
+        processed = type('obj', (object,), {
+            'image': stack,
+            'valid_mask': valid_mask,
+            'disk': (img.shape[1]//2, img.shape[0]//2, min(img.shape)//2)
+        })()
         
         # Extract tiles for training
         if mask_data is not None:

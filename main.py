@@ -42,11 +42,11 @@ Examples:
                              help='Path to training data directory')
     train_parser.add_argument('--use_cache', action='store_true',
                              help='Use cached .npy files if available')
-    train_parser.add_argument('--tile_size', type=int, default=128,
+    train_parser.add_argument('--tile_size', type=int, default=64,
                              help='Tile size for training patches (reduce for Kaggle memory constraints)')
     train_parser.add_argument('--overlap', type=float, default=0.25,
                              help='Overlap fraction for tiling')
-    train_parser.add_argument('--batch_size', type=int, default=2,
+    train_parser.add_argument('--batch_size', type=int, default=1,
                              help='Batch size for training (reduce for Kaggle memory constraints)')
     train_parser.add_argument('--epochs', type=int, default=50,
                              help='Number of training epochs')
