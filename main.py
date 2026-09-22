@@ -129,11 +129,23 @@ Examples:
         # Setup distributed training if multiple GPUs
         use_ddp = args.num_gpus > 1 and torch.cuda.device_count() >= args.num_gpus
         if use_ddp:
-            print(f"Using DDP with {args.num_gpus} GPUs")
-            torch.distributed.init_process_group(backend='nccl')
-            local_rank = int(os.environ.get('LOCAL_RANK', 0))
-            torch.cuda.set_device(local_rank)
-            device = torch.device(f'cuda:{local_rank}')
+            # Check if running with torchrun (proper DDP)
+            if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+                print(f"Using DDP with {args.num_gpus} GPUs (torchrun)")
+                torch.distributed.init_process_group(backend='nccl')
+                local_rank = int(os.environ.get('LOCAL_RANK', 0))
+                torch.cuda.set_device(local_rank)
+                device = torch.device(f'cuda:{local_rank}')
+            else:
+                # Fallback: if not using torchrun, use single GPU
+                print(f"Warning: --num_gpus {args.num_gpus} specified but not running with torchrun")
+                print(f"Falling back to single GPU training")
+                use_ddp = False
+                if args.device == 'cuda' and not torch.cuda.is_available():
+                    print("CUDA not available, falling back to CPU")
+                    device = torch.device('cpu')
+                else:
+                    device = torch.device(args.device)
         else:
             if args.device == 'cuda' and not torch.cuda.is_available():
                 print("CUDA not available, falling back to CPU")
