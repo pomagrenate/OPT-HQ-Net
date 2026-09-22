@@ -277,7 +277,7 @@ Examples:
                 train_dataset,
                 batch_size=args.batch_size,
                 sampler=train_sampler,
-                num_workers=2,
+                num_workers=0,  # Use 0 workers to avoid DDP deadlocks
                 pin_memory=True,
                 collate_fn=collate_fn
             )
@@ -286,7 +286,7 @@ Examples:
                 val_dataset,
                 batch_size=args.batch_size,
                 sampler=val_sampler,
-                num_workers=2,
+                num_workers=0,  # Use 0 workers to avoid DDP deadlocks
                 pin_memory=True,
                 collate_fn=collate_fn
             )
@@ -295,7 +295,7 @@ Examples:
                 data_root=args.data_root,
                 batch_size=args.batch_size,
                 tile_size=args.tile_size,
-                num_workers=2,
+                num_workers=0,  # Use 0 workers to avoid deadlocks
                 use_cache=args.use_cache,
                 val_split=0.1
             )

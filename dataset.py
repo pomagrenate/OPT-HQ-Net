@@ -319,7 +319,7 @@ class SolarFilamentDataset(Dataset):
 
 
 def create_dataloaders(data_root: str, batch_size: int = 4, 
-                      tile_size: int = 256, num_workers: int = 2,
+                      tile_size: int = 256, num_workers: int = 0,
                       use_cache: bool = True, val_split: float = 0.1) -> Tuple[torch.utils.data.DataLoader, 
                                                                                 Optional[torch.utils.data.DataLoader]]:
     """
@@ -329,7 +329,7 @@ def create_dataloaders(data_root: str, batch_size: int = 4,
         data_root: Path to the dataset root directory
         batch_size: Batch size for training
         tile_size: Size of tiles for training
-        num_workers: Number of worker processes for data loading
+        num_workers: Number of worker processes for data loading (use 0 for DDP stability)
         use_cache: Whether to use cached .npy files
         val_split: Fraction of data to use for validation
         
