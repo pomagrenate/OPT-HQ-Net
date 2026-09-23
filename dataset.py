@@ -37,7 +37,8 @@ class SolarFilamentDataset(Dataset):
         use_cache: bool = True,
         use_mmap: bool = True,
         augment: bool = False,
-        global_size: int = 512,
+        global_size: int = 256,
+        context_margin: float = 0.5,
         transform: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
         cache_limit: int = 16,
     ) -> None:
@@ -50,6 +51,14 @@ class SolarFilamentDataset(Dataset):
         self.use_mmap = use_mmap
         self.augment = augment and (self.split == 'train')
         self.global_size = global_size
+        # Fraction of tile_size added to EACH side of a tile's bounding box
+        # before it's used to sample the global context feature map (see
+        # model.spatial_align_crop). 0.5 means the model gets to see a
+        # window ~2x the tile's own footprint, centered on the tile — enough
+        # to pick up a filament that continues past the tile edge without
+        # blowing up compute. Must match what inference.tiled_predict uses,
+        # or train/inference context windows won't correspond.
+        self.context_margin = context_margin
         self.transform = transform
         # In-memory cache of fully preprocessed (clean_img, valid_mask, disk_meta)
         # keyed by file path. Each entry is a full-resolution float32 image
@@ -205,6 +214,19 @@ class SolarFilamentDataset(Dataset):
             self._cache_store[key] = res
         return res
 
+    def _tile_bbox_norm(self, ty: int, tx: int, h: int, w: int) -> np.ndarray:
+        """Context window for a tile at (ty, tx), padded by `context_margin`
+        on each side and expressed as a fraction of the full (h, w) frame.
+        Values may fall outside [0, 1] near the image border — that's fine,
+        `model.spatial_align_crop` uses border padding for out-of-range crops.
+        """
+        margin_px = self.context_margin * self.tile_size
+        x0 = (tx - margin_px) / float(w)
+        y0 = (ty - margin_px) / float(h)
+        x1 = (tx + self.tile_size + margin_px) / float(w)
+        y1 = (ty + self.tile_size + margin_px) / float(h)
+        return np.array([x0, y0, x1, y1], dtype=np.float32)
+
     def __len__(self) -> int:
         return len(self.image_files)
 
@@ -257,11 +279,13 @@ class SolarFilamentDataset(Dataset):
             dist_sun = np.sqrt((center_x - cx) ** 2 + (center_y - cy) ** 2)
             r_norm = dist_sun / max(float(r_sun), 1.0)
             coords = np.array([x_norm, y_norm, r_norm], dtype=np.float32)
+            bbox_norm = self._tile_bbox_norm(ty, tx, h, w)
 
             sample: Dict[str, Any] = {
                 'image': torch.from_numpy(np.ascontiguousarray(img_tile)).float(),
                 'global_image': global_tensor,
                 'coords': torch.from_numpy(coords).float(),
+                'bbox_norm': torch.from_numpy(bbox_norm).float(),
                 'valid_mask': torch.from_numpy(np.ascontiguousarray(valid_tile)).float(),
                 'mask': torch.from_numpy(np.ascontiguousarray(gt_tile)).float().unsqueeze(0),
                 'has_filament': has_fil,
@@ -295,6 +319,7 @@ def solar_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
             'image': torch.stack([b['image'] for b in batch], dim=0),
             'global_image': torch.stack([b['global_image'] for b in batch], dim=0),
             'coords': torch.stack([b['coords'] for b in batch], dim=0),
+            'bbox_norm': torch.stack([b['bbox_norm'] for b in batch], dim=0),
             'valid_mask': torch.stack([b['valid_mask'] for b in batch], dim=0),
             'mask': torch.stack([b['mask'] for b in batch], dim=0),
             'has_filament': torch.tensor([b['has_filament'] for b in batch], dtype=torch.bool),
@@ -319,6 +344,7 @@ def create_dataloaders(
     val_split: float = 0.1,
     num_workers: int = 2,
     use_cache: bool = True,
+    context_margin: float = 0.5,
     seed: int = 42,
 ) -> Tuple[DataLoader, Optional[DataLoader]]:
     full_dataset = SolarFilamentDataset(
@@ -328,6 +354,7 @@ def create_dataloaders(
         overlap=overlap,
         use_cache=use_cache,
         augment=True,
+        context_margin=context_margin,
     )
 
     total_samples = len(full_dataset)

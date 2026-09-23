@@ -91,6 +91,16 @@ class LinearAttention2D(nn.Module):
 
 
 class TinyGlobalEncoder(nn.Module):
+    """Encodes the whole-disk (downsampled) image into a small feature MAP.
+
+    Previously this ended in AdaptiveAvgPool2d((1, 1)), collapsing the entire
+    disk into a single vector that was broadcast identically to every tile.
+    That threw away exactly the information a tile needs to stay consistent
+    with its neighbours (e.g. a filament that continues past the tile edge).
+    We now keep the spatial map and let the caller sample the region that
+    matters for a given tile (see `spatial_align_crop` below).
+    """
+
     def __init__(self, in_ch: int = 1, out_ch: int = 128):
         super().__init__()
         self.net = nn.Sequential(
@@ -102,11 +112,56 @@ class TinyGlobalEncoder(nn.Module):
             DWSepConv(64, 96),
             nn.MaxPool2d(2),
             DWSepConv(96, out_ch),
-            nn.AdaptiveAvgPool2d((1, 1)),
+            # No AdaptiveAvgPool2d here on purpose: keep the spatial map.
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        return self.net(x)  # (B, out_ch, Hg, Wg)
+
+
+def spatial_align_crop(
+    feat_map: torch.Tensor,
+    bbox_norm: torch.Tensor,
+    out_size: tuple[int, int],
+) -> torch.Tensor:
+    """Crop-and-resize `feat_map` to the region given by `bbox_norm`, per batch item.
+
+    Args:
+        feat_map: (B, C, Hg, Wg) feature map covering the FULL frame that the
+            global image was resized from (i.e. the whole solar disk image).
+        bbox_norm: (B, 4) tensor of (x0, y0, x1, y1), each a fraction of the
+            full frame's width/height. Values may fall outside [0, 1] (e.g.
+            a tile's context box padded past the image border); those are
+            handled with border padding rather than clipped beforehand, so
+            near-limb tiles still get a sensible (edge-replicated) context.
+        out_size: (H, W) spatial size to resample the crop to — typically the
+            spatial size of the local feature map it will be fused with.
+
+    Returns:
+        (B, C, out_size[0], out_size[1]) tensor: for each batch item, the
+        `feat_map` region described by its bbox, resampled to `out_size`.
+    """
+    b = feat_map.shape[0]
+    x0 = bbox_norm[:, 0] * 2.0 - 1.0
+    y0 = bbox_norm[:, 1] * 2.0 - 1.0
+    x1 = bbox_norm[:, 2] * 2.0 - 1.0
+    y1 = bbox_norm[:, 3] * 2.0 - 1.0
+
+    a_x = (x1 - x0) / 2.0
+    b_x = (x0 + x1) / 2.0
+    a_y = (y1 - y0) / 2.0
+    b_y = (y0 + y1) / 2.0
+
+    theta = torch.zeros(b, 2, 3, dtype=feat_map.dtype, device=feat_map.device)
+    theta[:, 0, 0] = a_x
+    theta[:, 0, 2] = b_x
+    theta[:, 1, 1] = a_y
+    theta[:, 1, 2] = b_y
+
+    grid = F.affine_grid(
+        theta, size=(b, feat_map.shape[1], out_size[0], out_size[1]), align_corners=False
+    )
+    return F.grid_sample(feat_map, grid, mode="bilinear", padding_mode="border", align_corners=False)
 
 
 class DilatedBottleneck(nn.Module):
@@ -186,7 +241,20 @@ class MicroFilNet(nn.Module):
         local_x: torch.Tensor,
         global_x: torch.Tensor,
         coords: torch.Tensor,
+        bbox_norm: torch.Tensor,
     ) -> torch.Tensor:
+        """
+        Args:
+            local_x: (B, in_ch, tile, tile) local tile.
+            global_x: (B, in_ch, Gh, Gw) whole-disk image, downsampled.
+            coords: (B, 3) = (x_norm, y_norm, r_norm) of the tile CENTER,
+                same as before — still useful as an absolute-position cue.
+            bbox_norm: (B, 4) = (x0, y0, x1, y1) of the tile's CONTEXT WINDOW
+                (the tile extent, typically padded with a margin) as a
+                fraction of the full-disk frame. This is what lets the model
+                see structure beyond its own tile boundary. See dataset.py /
+                inference.py for how this is computed.
+        """
         edge_map = self.edge_extractor(local_x)
 
         feat = self.stem(local_x)
@@ -195,13 +263,13 @@ class MicroFilNet(nn.Module):
             feat, skip = enc(feat)
             skips.append(skip)
 
-        g_feat = self.global_encoder(global_x)
-        g_feat_expand = g_feat.expand(-1, -1, feat.shape[2], feat.shape[3])
+        g_map = self.global_encoder(global_x)
+        g_feat_aligned = spatial_align_crop(g_map, bbox_norm, out_size=feat.shape[-2:])
 
         c_feat = self.coord_proj(coords).unsqueeze(-1).unsqueeze(-1)
         c_feat_expand = c_feat.expand(-1, -1, feat.shape[2], feat.shape[3])
 
-        fused = torch.cat([feat, g_feat_expand, c_feat_expand], dim=1)
+        fused = torch.cat([feat, g_feat_aligned, c_feat_expand], dim=1)
         fused = self.bottleneck_fuse(fused)
         fused = self.bottleneck(fused, edge_map)
 

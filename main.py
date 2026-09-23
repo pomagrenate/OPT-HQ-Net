@@ -40,6 +40,7 @@ def parse_args():
     train_parser.add_argument("--use_cache", action=argparse.BooleanOptionalAction, default=True)
     train_parser.add_argument("--tile_size", type=int, default=512)
     train_parser.add_argument("--overlap", type=float, default=0.25)
+    train_parser.add_argument("--context_margin", type=float, default=0.5)
     train_parser.add_argument("--batch_size", type=int, default=4)
     train_parser.add_argument("--epochs", type=int, default=50)
     train_parser.add_argument("--lr", type=float, default=1e-4)
@@ -61,6 +62,7 @@ def parse_args():
     predict_parser.add_argument("--use_cache", action=argparse.BooleanOptionalAction, default=True)
     predict_parser.add_argument("--tile_size", type=int, default=512)
     predict_parser.add_argument("--overlap", type=float, default=0.25)
+    predict_parser.add_argument("--context_margin", type=float, default=0.5)
     predict_parser.add_argument("--threshold", type=float, default=0.5)
     predict_parser.add_argument("--min_area", type=int, default=30)
     predict_parser.add_argument("--close_kernel", type=int, default=3)
@@ -89,6 +91,7 @@ def save_full_disk_validation_plot(
     out_dir: Path,
     tile_size: int = 512,
     overlap: float = 0.25,
+    context_margin: float = 0.5,
 ):
     out_dir.mkdir(parents=True, exist_ok=True)
     model.eval()
@@ -109,7 +112,9 @@ def save_full_disk_validation_plot(
     image_stack = np.expand_dims(clean_img, axis=0)
     valid_mask_stack = np.expand_dims(valid_mask, axis=0)
 
-    global_img = cv2.resize(clean_img, (512, 512), interpolation=cv2.INTER_AREA)
+    global_img = cv2.resize(
+        clean_img, (underlying_dataset.global_size, underlying_dataset.global_size), interpolation=cv2.INTER_AREA
+    )
     global_stack = np.expand_dims(global_img, axis=0).astype(np.float32)
 
     prob_map = tiled_predict(
@@ -122,6 +127,7 @@ def save_full_disk_validation_plot(
         overlap=overlap,
         device=device,
         batch_size=4,
+        context_margin=context_margin,
     )
 
     pred_mask = (prob_map >= 0.5).astype(np.float32)
@@ -203,6 +209,7 @@ def run_training(args):
         overlap=args.overlap,
         use_cache=args.use_cache,
         augment=True,
+        context_margin=args.context_margin,
     )
 
     full_val_dataset = SolarFilamentDataset(
@@ -212,6 +219,7 @@ def run_training(args):
         overlap=args.overlap,
         use_cache=args.use_cache,
         augment=False,
+        context_margin=args.context_margin,
     )
 
     total_len = len(full_train_dataset)
@@ -270,13 +278,14 @@ def run_training(args):
             images = batch["image"].to(device, non_blocking=True)
             global_images = batch["global_image"].to(device, non_blocking=True)
             coords = batch["coords"].to(device, non_blocking=True)
+            bbox_norm = batch["bbox_norm"].to(device, non_blocking=True)
             valid_masks = batch["valid_mask"].to(device, non_blocking=True)
             masks = batch["mask"].to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
 
             with torch.amp.autocast(device_type=device.type, enabled=(args.use_amp and device.type == "cuda")):
-                logits = model(images, global_images, coords)
+                logits = model(images, global_images, coords, bbox_norm)
 
             loss, _ = criterion(logits.float(), masks.float(), valid_masks.float(), epoch)
 
@@ -309,9 +318,10 @@ def run_training(args):
                     images = batch["image"].to(device, non_blocking=True)
                     global_images = batch["global_image"].to(device, non_blocking=True)
                     coords = batch["coords"].to(device, non_blocking=True)
+                    bbox_norm = batch["bbox_norm"].to(device, non_blocking=True)
                     valid_masks = batch["valid_mask"].to(device, non_blocking=True)
                     masks = batch["mask"].to(device, non_blocking=True)
-                    logits = eval_target(images, global_images, coords)
+                    logits = eval_target(images, global_images, coords, bbox_norm)
                     l_val, _ = criterion(logits.float(), masks.float(), valid_masks.float(), epoch)
                     val_loss += l_val.item()
 
@@ -333,6 +343,7 @@ def run_training(args):
                     out_dir=val_plot_dir,
                     tile_size=args.tile_size,
                     overlap=args.overlap,
+                    context_margin=args.context_margin,
                 )
 
         scheduler.step()
@@ -395,6 +406,7 @@ def run_prediction(args):
         tile_size=args.tile_size,
         overlap=args.overlap,
         use_cache=args.use_cache,
+        context_margin=args.context_margin,
     )
 
     predictions = {}
@@ -417,6 +429,7 @@ def run_prediction(args):
                 overlap=args.overlap,
                 device=device,
                 batch_size=args.batch_size,
+                context_margin=args.context_margin,
             )
 
             binary = postprocess_mask(

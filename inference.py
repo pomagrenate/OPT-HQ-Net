@@ -24,7 +24,16 @@ def tiled_predict(
     overlap: float = 0.25,
     device: str | torch.device = "cpu",
     batch_size: int = 4,
+    context_margin: float = 0.5,
 ) -> np.ndarray:
+    """
+    context_margin must match the value SolarFilamentDataset was trained
+    with (default 0.5 in both places) — it controls how far past each
+    tile's own footprint the global-context crop extends. A mismatch here
+    doesn't break shapes (spatial_align_crop is fully general), but it does
+    mean the model sees a differently-scaled context window than it trained
+    on, which can quietly hurt near-tile-edge predictions.
+    """
     model.eval()
     dev = torch.device(device)
     c, h, w = image.shape
@@ -48,12 +57,15 @@ def tiled_predict(
     xs = list(range(0, wp - tile + 1, stride))
     coords_list = [(y, x) for y in ys for x in xs]
 
+    margin_px = context_margin * tile
+
     for i in range(0, len(coords_list), batch_size):
         batch_coords = coords_list[i : i + batch_size]
         batch_tensors = [img_tensor[:, y : y + tile, x : x + tile] for y, x in batch_coords]
         batch_local = torch.stack(batch_tensors, dim=0).to(dev, non_blocking=True)
 
         batch_meta = []
+        batch_bbox = []
         for y, x in batch_coords:
             center_x = x + tile / 2.0
             center_y = y + tile / 2.0
@@ -61,11 +73,19 @@ def tiled_predict(
             y_norm = center_y / float(h)
             r_norm = np.sqrt((center_x - cx) ** 2 + (center_y - cy) ** 2) / max(float(r_sun), 1.0)
             batch_meta.append([x_norm, y_norm, r_norm])
+
+            x0c = (x - margin_px) / float(w)
+            y0c = (y - margin_px) / float(h)
+            x1c = (x + tile + margin_px) / float(w)
+            y1c = (y + tile + margin_px) / float(h)
+            batch_bbox.append([x0c, y0c, x1c, y1c])
+
         batch_meta_t = torch.tensor(batch_meta, dtype=torch.float32, device=dev)
+        batch_bbox_t = torch.tensor(batch_bbox, dtype=torch.float32, device=dev)
 
         batch_global = global_tensor.expand(batch_local.size(0), -1, -1, -1)
 
-        logits = model(batch_local, batch_global, batch_meta_t)
+        logits = model(batch_local, batch_global, batch_meta_t, batch_bbox_t)
         probs = torch.sigmoid(logits.float())[:, 0]
 
         for idx, (y, x) in enumerate(batch_coords):
