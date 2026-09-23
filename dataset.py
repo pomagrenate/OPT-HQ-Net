@@ -21,7 +21,7 @@ except ImportError:
 
 from preprocessing import (
     continuity_safe_augment,
-    preprocess_halpha_fast,
+    preprocess_halpha,
 )
 
 
@@ -32,26 +32,18 @@ class SolarFilamentDataset(Dataset):
         self,
         data_root: str | Path,
         split: str = 'train',
-        tile_size: int = 512,
-        overlap: float = 0.25,
         use_cache: bool = True,
         use_mmap: bool = True,
         augment: bool = False,
-        global_size: int = 256,
-        context_margin: float = 0.5,
         transform: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
-        cache_limit: int = 16,
+        cache_limit: int = 8,
     ) -> None:
         super().__init__()
         self.data_root = Path(data_root)
         self.split = split.lower()
-        self.tile_size = tile_size
-        self.overlap = overlap
         self.use_cache = use_cache
         self.use_mmap = use_mmap
         self.augment = augment and (self.split == 'train')
-        self.global_size = global_size
-        self.context_margin = context_margin
         self.transform = transform
         self.cache_limit = max(0, cache_limit)
 
@@ -185,7 +177,7 @@ class SolarFilamentDataset(Dataset):
             raw_arr = raw_arr[0]
 
         if raw_arr.ndim == 2:
-            clean_img, mask, meta = preprocess_halpha_fast(raw_arr)
+            clean_img, mask, meta = preprocess_halpha(raw_arr)
         elif raw_arr.ndim == 3:
             clean_img = raw_arr[0]
             mask = np.ones_like(clean_img)
@@ -199,14 +191,6 @@ class SolarFilamentDataset(Dataset):
             self._cache_store[key] = res
         return res
 
-    def _tile_bbox_norm(self, ty: int, tx: int, h: int, w: int) -> np.ndarray:
-        margin_px = self.context_margin * self.tile_size
-        x0 = (tx - margin_px) / float(w)
-        y0 = (ty - margin_px) / float(h)
-        x1 = (tx + self.tile_size + margin_px) / float(w)
-        y1 = (ty + self.tile_size + margin_px) / float(h)
-        return np.array([x0, y0, x1, y1], dtype=np.float32)
-
     def __len__(self) -> int:
         return len(self.image_files)
 
@@ -215,73 +199,30 @@ class SolarFilamentDataset(Dataset):
         clean_img, valid_mask, (cx, cy, r_sun) = self._get_processed_data(img_path)
         h, w = clean_img.shape
 
-        global_img = cv2.resize(clean_img, (self.global_size, self.global_size), interpolation=cv2.INTER_AREA)
-        global_tensor = torch.from_numpy(np.ascontiguousarray(global_img)).unsqueeze(0).float()
+        img_full = clean_img[np.newaxis, ...]
+        valid_full = valid_mask[np.newaxis, ...]
 
         if self.split == 'train':
             gt_mask = self._generate_mask(img_path.name, fallback_shape=(h, w))
             if gt_mask is None:
                 gt_mask = np.zeros((h, w), dtype=np.float32)
 
-            polygons = self.img_to_polygons.get(img_path.name, [])
-            use_smart_roi = (len(polygons) > 0) and (np.random.rand() < 0.70)
-
-            if use_smart_roi:
-                chosen_poly = polygons[np.random.randint(len(polygons))]
-                pts = np.array(chosen_poly, dtype=np.float32).reshape(-1, 2)
-                min_x, min_y = pts.min(axis=0)
-                max_x, max_y = pts.max(axis=0)
-
-                anchor_x = np.random.uniform(min_x, max_x)
-                anchor_y = np.random.uniform(min_y, max_y)
-
-                offset_x = np.random.uniform(0.15, 0.85) * self.tile_size
-                offset_y = np.random.uniform(0.15, 0.85) * self.tile_size
-
-                tx = int(anchor_x - offset_x)
-                ty = int(anchor_y - offset_y)
-            else:
-                tx = np.random.randint(0, max(1, w - self.tile_size + 1))
-                ty = np.random.randint(0, max(1, h - self.tile_size + 1))
-
-            tx = int(np.clip(tx, 0, max(0, w - self.tile_size)))
-            ty = int(np.clip(ty, 0, max(0, h - self.tile_size)))
-
-            img_tile = clean_img[ty : ty + self.tile_size, tx : tx + self.tile_size][np.newaxis, ...]
-            valid_tile = valid_mask[ty : ty + self.tile_size, tx : tx + self.tile_size][np.newaxis, ...]
-            gt_tile = gt_mask[ty : ty + self.tile_size, tx : tx + self.tile_size]
-            has_fil = bool(gt_tile.sum() > 0)
-
             if self.augment:
-                img_tile, gt_tile, valid_tile = continuity_safe_augment(
-                    img_tile, gt_tile, valid_tile
+                img_full, gt_mask, valid_full = continuity_safe_augment(
+                    img_full, gt_mask, valid_full
                 )
 
-            center_y = ty + self.tile_size / 2.0
-            center_x = tx + self.tile_size / 2.0
-            x_norm = center_x / float(w)
-            y_norm = center_y / float(h)
-            dist_sun = np.sqrt((center_x - cx) ** 2 + (center_y - cy) ** 2)
-            r_norm = dist_sun / max(float(r_sun), 1.0)
-            coords = np.array([x_norm, y_norm, r_norm], dtype=np.float32)
-            bbox_norm = self._tile_bbox_norm(ty, tx, h, w)
-
             sample: Dict[str, Any] = {
-                'image': torch.from_numpy(np.ascontiguousarray(img_tile)).float(),
-                'global_image': global_tensor,
-                'coords': torch.from_numpy(coords).float(),
-                'bbox_norm': torch.from_numpy(bbox_norm).float(),
-                'valid_mask': torch.from_numpy(np.ascontiguousarray(valid_tile)).float(),
-                'mask': torch.from_numpy(np.ascontiguousarray(gt_tile)).float().unsqueeze(0),
-                'has_filament': has_fil,
-                'tile_coords': torch.tensor([ty, tx], dtype=torch.long),
+                'image': torch.from_numpy(np.ascontiguousarray(img_full)).float(),
+                'valid_mask': torch.from_numpy(np.ascontiguousarray(valid_full)).float(),
+                'mask': torch.from_numpy(np.ascontiguousarray(gt_mask)).float().unsqueeze(0),
+                'has_filament': bool(gt_mask.sum() > 0),
                 'image_id': img_path.stem,
             }
         else:
             sample = {
-                'image': torch.from_numpy(np.ascontiguousarray(clean_img[np.newaxis, ...])).float(),
-                'global_image': global_tensor,
-                'valid_mask': torch.from_numpy(np.ascontiguousarray(valid_mask[np.newaxis, ...])).float(),
+                'image': torch.from_numpy(np.ascontiguousarray(img_full)).float(),
+                'valid_mask': torch.from_numpy(np.ascontiguousarray(valid_full)).float(),
                 'mask': None,
                 'image_id': img_path.stem,
                 'disk': (cx, cy, r_sun),
@@ -302,20 +243,15 @@ def solar_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     if has_mask:
         return {
             'image': torch.stack([b['image'] for b in batch], dim=0),
-            'global_image': torch.stack([b['global_image'] for b in batch], dim=0),
-            'coords': torch.stack([b['coords'] for b in batch], dim=0),
-            'bbox_norm': torch.stack([b['bbox_norm'] for b in batch], dim=0),
             'valid_mask': torch.stack([b['valid_mask'] for b in batch], dim=0),
             'mask': torch.stack([b['mask'] for b in batch], dim=0),
             'has_filament': torch.tensor([b['has_filament'] for b in batch], dtype=torch.bool),
-            'tile_coords': torch.stack([b['tile_coords'] for b in batch], dim=0),
             'image_id': [b['image_id'] for b in batch],
         }
 
     return {
-        'image': [b['image'] for b in batch],
-        'global_image': [b['global_image'] for b in batch],
-        'valid_mask': [b['valid_mask'] for b in batch],
+        'image': torch.stack([b['image'] for b in batch], dim=0),
+        'valid_mask': torch.stack([b['valid_mask'] for b in batch], dim=0),
         'image_id': [b['image_id'] for b in batch],
         'disk': [b.get('disk') for b in batch],
     }
@@ -323,23 +259,17 @@ def solar_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 def create_dataloaders(
     data_root: str | Path,
-    batch_size: int = 4,
-    tile_size: int = 512,
-    overlap: float = 0.25,
+    batch_size: int = 1,
     val_split: float = 0.1,
     num_workers: int = 2,
     use_cache: bool = True,
-    context_margin: float = 0.5,
     seed: int = 42,
 ) -> Tuple[DataLoader, Optional[DataLoader]]:
     full_dataset = SolarFilamentDataset(
         data_root=data_root,
         split='train',
-        tile_size=tile_size,
-        overlap=overlap,
         use_cache=use_cache,
         augment=True,
-        context_margin=context_margin,
     )
 
     total_samples = len(full_dataset)

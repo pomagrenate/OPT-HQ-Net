@@ -87,7 +87,7 @@ class MicroFilNetLoss(nn.Module):
         w_bce: float = 1.0,
         w_dice: float = 1.0,
         w_cldice_target: float = 0.2,
-        w_boundary: float = 0.15,
+        w_boundary: float = 0.2,
         cldice_warmup_epochs: int = 12,
         skel_iters: int = 3,
         bce_pos_weight: float = 3.0,
@@ -113,35 +113,42 @@ class MicroFilNetLoss(nn.Module):
         gy = F.conv2d(x, sy, padding=1)
         return torch.sqrt(gx.pow(2) + gy.pow(2) + 1e-8)
 
-    def _boundary_loss(self, pred_prob: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        edge_pred = self._sobel_edges(pred_prob)
-        edge_true = self._sobel_edges(target)
-        return F.l1_loss(edge_pred, edge_true)
-
     def forward(
         self,
-        logits: torch.Tensor,
+        preds: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         target: torch.Tensor,
         valid_mask: torch.Tensor,
         epoch: int,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        logits = logits.float()
+        if isinstance(preds, tuple):
+            mask_logits, boundary_logits = preds
+        else:
+            mask_logits, boundary_logits = preds, None
+
+        mask_logits = mask_logits.float()
         target = target.float()
         valid_mask = valid_mask.float()
 
-        prob = torch.sigmoid(logits)
+        prob = torch.sigmoid(mask_logits)
         prob_masked = prob * valid_mask
         target_masked = target * valid_mask
 
-        l_bce = masked_bce(logits, target, valid_mask, pos_weight_val=self.bce_pos_weight)
+        l_bce = masked_bce(mask_logits, target, valid_mask, pos_weight_val=self.bce_pos_weight)
         l_dice = dice_loss(prob_masked, target_masked)
-        l_bnd = self._boundary_loss(prob_masked, target_masked)
+
+        edge_true = self._sobel_edges(target_masked)
+        if boundary_logits is not None:
+            boundary_prob = torch.sigmoid(boundary_logits.float()) * valid_mask
+            l_bnd = F.l1_loss(boundary_prob, edge_true)
+        else:
+            edge_pred = self._sobel_edges(prob_masked)
+            l_bnd = F.l1_loss(edge_pred, edge_true)
 
         w_cl = cl_dice_weight_schedule(epoch, self.cldice_warmup_epochs, self.w_cldice_target)
         if w_cl > 0.0:
             l_cl = soft_cl_dice(prob_masked, target_masked, n_iter=self.skel_iters)
         else:
-            l_cl = torch.zeros((), device=logits.device, dtype=torch.float32)
+            l_cl = torch.zeros((), device=mask_logits.device, dtype=torch.float32)
 
         total = (
             self.w_bce * l_bce
@@ -154,7 +161,6 @@ class MicroFilNetLoss(nn.Module):
             "bce": l_bce.detach(),
             "dice": l_dice.detach(),
             "cldice": l_cl.detach(),
-            "cldice_w": torch.tensor(w_cl, device=logits.device),
             "boundary": l_bnd.detach(),
             "total": total.detach(),
         }
