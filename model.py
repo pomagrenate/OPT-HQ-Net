@@ -1,3 +1,5 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
 from __future__ import annotations
 
 import torch
@@ -5,182 +7,178 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class DWSepConv(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, dilation: int = 1):
+class Conv(nn.Module):
+    """Standard convolution with GroupNorm and SiLU activation."""
+    def __init__(self, c1, c2, k=1, s=1, p=0, g=1, act=True):
         super().__init__()
-        self.dw = nn.Conv2d(
-            in_ch, in_ch, 3, padding=dilation, dilation=dilation, groups=in_ch, bias=False
-        )
-        self.bn1 = nn.BatchNorm2d(in_ch)
-        self.pw = nn.Conv2d(in_ch, out_ch, 1, bias=False)
-        self.bn2 = nn.BatchNorm2d(out_ch)
-        self.act = nn.SiLU(inplace=True)
+        c1, c2, k, s, g = int(c1), int(c2), int(k), int(s), int(g)
+        self.conv = nn.Conv2d(c1, c2, k, s, autopad(k), groups=g, bias=False)
+        self.norm = nn.GroupNorm(min(8, c2), c2)
+        self.act = nn.SiLU(inplace=True) if act else nn.Identity()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.act(self.bn2(self.pw(self.act(self.bn1(self.dw(x))))))
+    def forward(self, x):
+        return self.act(self.norm(self.conv(x)))
 
 
-class StripPooling(nn.Module):
-    def __init__(self, ch: int):
+def autopad(k):
+    """Pad to 'same' output dimensions when not specified."""
+    if isinstance(k, int):
+        return k // 2
+    if isinstance(k, (list, tuple)):
+        return [x // 2 for x in k]
+    return int(k) // 2
+
+
+class Bottleneck(nn.Module):
+    """Standard bottleneck."""
+    def __init__(self, c1, c2, shortcut=True, g=1, k=3, e=0.5):
         super().__init__()
-        self.conv_h = nn.Conv2d(ch, ch, 1, bias=False)
-        self.conv_v = nn.Conv2d(ch, ch, 1, bias=False)
-        self.fuse = nn.Conv2d(ch, ch, 1, bias=False)
-        self.bn = nn.BatchNorm2d(ch)
+        c_ = int(c2 * e)
+        self.cv1 = Conv(c1, c_, k, 1)
+        self.cv2 = Conv(c_, c2, k, 1, g=1)
+        self.add = shortcut and c1 == c2
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h, w = x.shape[-2:]
-        x_h = self.conv_h(F.adaptive_avg_pool2d(x, (h, 1)))
-        x_v = self.conv_v(F.adaptive_avg_pool2d(x, (1, w)))
-        strip = self.fuse(x_h + x_v)
-        gate = torch.sigmoid(self.bn(strip))
-        return x + x * gate
+    def forward(self, x):
+        return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
 
 
-class MultiScaleDilationMixer(nn.Module):
-    def __init__(self, ch: int):
+class C3k2(nn.Module):
+    """C3k2 module with CSP bottleneck - simplified version."""
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
         super().__init__()
-        sub_ch = ch // 4
-        self.sub_ch = sub_ch
-        self.d1 = DWSepConv(sub_ch, sub_ch, dilation=1)
-        self.d2 = DWSepConv(sub_ch, sub_ch, dilation=2)
-        self.d4 = DWSepConv(sub_ch, sub_ch, dilation=4)
-        self.d8 = DWSepConv(sub_ch, sub_ch, dilation=8)
-        self.strip = StripPooling(ch)
-        self.fuse = nn.Sequential(
-            nn.Conv2d(ch, ch, 1, bias=False),
-            nn.BatchNorm2d(ch),
-            nn.SiLU(inplace=True),
-        )
+        self.c_ = int(c2 * e)
+        self.cv1 = Conv(c1, self.c_, 1, 1)
+        self.cv2 = Conv(c1, self.c_, 1, 1)
+        self.cv3 = Conv(2 * self.c_, c2, 1)
+        self.m = nn.Sequential(*(Bottleneck(self.c_, self.c_, shortcut, g) for _ in range(n)))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        xs = torch.split(x, self.sub_ch, dim=1)
-        o1 = self.d1(xs[0])
-        o2 = self.d2(xs[1])
-        o4 = self.d4(xs[2])
-        o8 = self.d8(xs[3])
-        out = torch.cat([o1, o2, o4, o8], dim=1)
-        return self.strip(self.fuse(out))
+    def forward(self, x):
+        return self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), 1))
 
 
-class HighResDetailStream(nn.Module):
-    def __init__(self):
+class SPPF(nn.Module):
+    """Spatial Pyramid Pooling - Fast."""
+    def __init__(self, c1, c2, k=5):
         super().__init__()
-        self.stem = nn.Sequential(
-            nn.Conv2d(1, 4, 3, padding=1, bias=False),
-            nn.BatchNorm2d(4),
-            nn.SiLU(inplace=True),
-            DWSepConv(4, 4),
-        )
-        self.down = nn.Sequential(
-            nn.Conv2d(4, 8, 3, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(8),
-            nn.SiLU(inplace=True),
-            DWSepConv(8, 8),
-        )
+        c_ = c1 // 2
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c_ * 4, c2, 1, 1)
+        self.m = nn.MaxPool2d(kernel_size=k, stride=1, padding=k // 2)
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        f_2048 = self.stem(x)
-        f_1024 = self.down(f_2048)
-        return f_2048, f_1024
+    def forward(self, x):
+        x = self.cv1(x)
+        y1 = self.m(x)
+        y2 = self.m(y1)
+        return self.cv2(torch.cat((x, y1, y2, self.m(y2)), 1))
 
 
-class CoarseContextStream(nn.Module):
-    def __init__(self):
+class FilamentSegmentation(nn.Module):
+    """
+    Solar Filament Segmentation Model based on YOLO26 architecture.
+    
+    Features:
+    - P2/P3/P4/P5 feature pyramid for multi-scale understanding
+    - PANet neck for feature fusion
+    - Lightweight segmentation head
+    - Full 2048x2048 input support
+    - Optimized for thin filament detection
+    """
+    
+    def __init__(self, in_channels=1, num_classes=1):
         super().__init__()
-        self.stem = nn.Sequential(
-            nn.Conv2d(1, 16, 3, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(16),
-            nn.SiLU(inplace=True),
-            DWSepConv(16, 24),
-            nn.MaxPool2d(2),
-            DWSepConv(24, 32),
-            nn.MaxPool2d(2),
-            DWSepConv(32, 48),
-        )
-        self.down_stage = nn.Sequential(
-            nn.MaxPool2d(2),
-            DWSepConv(48, 64),
-            nn.MaxPool2d(2),
-            DWSepConv(64, 96),
-        )
-        self.mixer = MultiScaleDilationMixer(96)
+        self.in_channels = in_channels
+        self.num_classes = num_classes
+        
+        # Backbone
+        self.backbone = self._build_backbone()
+        
+        # Neck
+        self.neck = self._build_neck()
+        
+        # Segmentation head
+        self.head = self._build_head()
 
-    def forward(self, x_256: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        f_32 = self.stem(x_256)
-        f_8 = self.down_stage(f_32)
-        f_8 = self.mixer(f_8)
-        return f_32, f_8
+    def _build_backbone(self):
+        """Build backbone network."""
+        return nn.ModuleList([
+            Conv(self.in_channels, 32, 3, 2),  # 0: 2048->1024
+            Conv(32, 64, 3, 2),                # 1: 1024->512 (P2)
+            Conv(64, 128, 3, 2),               # 2: 512->256 (P3)
+            Conv(128, 192, 3, 2),              # 3: 256->128 (P4)
+            Conv(192, 256, 3, 2),              # 4: 128->64 (P5)
+            SPPF(256, 256, 5),                # 5
+        ])
 
+    def _build_neck(self):
+        """Build PANet neck."""
+        return nn.ModuleList([
+            nn.Upsample(None, 2, "nearest"),  # 0
+            Conv(448, 192, 1, 1, 0),          # 1: reduce concat channels (256+192)
+            nn.Upsample(None, 2, "nearest"),  # 2
+            Conv(320, 128, 1, 1, 0),          # 3: reduce concat channels (192+128)
+            nn.Upsample(None, 2, "nearest"),  # 4
+            Conv(192, 64, 1, 1, 0),           # 5: reduce concat channels (128+64)
+            Conv(64, 64, 3, 2),                # 6
+            Conv(192, 128, 1, 1, 0),          # 7: reduce concat channels (64+128)
+            Conv(128, 128, 3, 2),              # 8
+            Conv(320, 192, 1, 1, 0),          # 9: reduce concat channels (128+192)
+        ])
 
-class MicroFilNet(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.high_res_stream = HighResDetailStream()
-        self.context_stream = CoarseContextStream()
+    def _build_head(self):
+        """Build segmentation head."""
+        head = nn.ModuleList([
+            Conv(64, 16, 1, 1, 0),             # 0: reduce to prototype channels
+            Conv(16, 16, 3, 1),                # 1: prototype refinement
+            nn.Upsample(None, 2, "bilinear"), # 2: 512->1024
+            Conv(16, 16, 3, 1),                # 3: refinement at 1024
+            nn.Upsample(None, 2, "bilinear"), # 4: 1024->2048
+            nn.Conv2d(16, self.num_classes, 1, 1, 0),  # 5: final mask
+        ])
+        # Initialize bias for better convergence
+        nn.init.constant_(head[5].bias, -2.0)
+        return head
 
-        self.global_gate_1024 = nn.Sequential(
-            nn.Conv2d(96, 8, 1, bias=False),
-            nn.BatchNorm2d(8),
-            nn.Sigmoid(),
-        )
+    def forward(self, x):
+        """Forward pass."""
+        # Backbone
+        x = self.backbone[0](x)        # 0: 2048->1024
+        p2 = self.backbone[1](x)        # 1: 1024->512 (P2)
+        p3 = self.backbone[2](p2)       # 2: 512->256 (P3)
+        p4 = self.backbone[3](p3)       # 3: 256->128 (P4)
+        p5 = self.backbone[4](p4)       # 4: 128->64 (P5)
+        p5 = self.backbone[5](p5)       # 5: SPPF
 
-        self.global_gate_2048 = nn.Sequential(
-            nn.Conv2d(48, 4, 1, bias=False),
-            nn.BatchNorm2d(4),
-            nn.Sigmoid(),
-        )
+        # Neck - Top-down
+        x = self.neck[0](p5)            # 0: upsample
+        x = torch.cat([x, p4], dim=1)   # concat P4 (256+192=448)
+        p4_fused = self.neck[1](x)      # 1: reduce channels
 
-        self.refine_1024 = nn.Sequential(
-            DWSepConv(8, 8),
-            DWSepConv(8, 8),
-        )
+        x = self.neck[2](p4_fused)      # 2: upsample
+        x = torch.cat([x, p3], dim=1)   # concat P3 (192+128=320)
+        p3_fused = self.neck[3](x)      # 3: reduce channels
 
-        self.up_to_2048 = nn.Sequential(
-            nn.Conv2d(8 + 4, 8, 1, bias=False),
-            nn.BatchNorm2d(8),
-            nn.SiLU(inplace=True),
-            DWSepConv(8, 4),
-        )
+        x = self.neck[4](p3_fused)      # 4: upsample
+        x = torch.cat([x, p2], dim=1)   # concat P2 (128+64=192)
+        p2_fused = self.neck[5](x)      # 5: reduce channels
 
-        self.mask_head = nn.Sequential(
-            nn.Conv2d(4, 4, 3, padding=1, bias=False),
-            nn.BatchNorm2d(4),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(4, 1, 1),
-        )
+        # Neck - Bottom-up
+        x = self.neck[6](p2_fused)      # 6: downsample
+        x = torch.cat([x, p3_fused], dim=1)  # concat P3 (64+128=192)
+        p3_final = self.neck[7](x)      # 7: reduce channels
 
-        self.boundary_head = nn.Sequential(
-            nn.Conv2d(4, 4, 3, padding=1, bias=False),
-            nn.BatchNorm2d(4),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(4, 1, 1),
-        )
+        x = self.neck[8](p3_final)      # 8: downsample
+        x = torch.cat([x, p4_fused], dim=1)  # concat P4 (128+192=320)
+        p4_final = self.neck[9](x)      # 9: reduce channels
 
-        nn.init.constant_(self.mask_head[-1].bias, -2.0)
-        nn.init.constant_(self.boundary_head[-1].bias, -2.0)
+        # Head
+        x = self.head[0](p2_fused)      # 0: reduce to 16 channels
+        x = self.head[1](x)             # 1: prototype refinement
+        x = self.head[2](x)             # 2: upsample to 1024
+        x = self.head[3](x)             # 3: refinement
+        x = self.head[4](x)             # 4: upsample to 2048
+        mask = self.head[5](x)          # 5: final mask
 
-    def forward(self, x_full: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        x_coarse = F.interpolate(x_full, size=(256, 256), mode="bilinear", align_corners=False)
-
-        f_2048, f_1024 = self.high_res_stream(x_full)
-        f_coarse_32, f_coarse_8 = self.context_stream(x_coarse)
-
-        gate_1024 = F.interpolate(f_coarse_8, size=f_1024.shape[-2:], mode="bilinear", align_corners=False)
-        gate_1024 = self.global_gate_1024(gate_1024)
-        f_1024 = self.refine_1024(f_1024 * gate_1024 + f_1024)
-
-        f_1024_up = F.interpolate(f_1024, size=f_2048.shape[-2:], mode="bilinear", align_corners=False)
-        gate_2048 = F.interpolate(f_coarse_32, size=f_2048.shape[-2:], mode="bilinear", align_corners=False)
-        gate_2048 = self.global_gate_2048(gate_2048)
-        f_2048 = f_2048 * gate_2048 + f_2048
-
-        f_final = self.up_to_2048(torch.cat([f_1024_up, f_2048], dim=1))
-
-        mask_logits = self.mask_head(f_final)
-        boundary_logits = self.boundary_head(f_final)
-
-        return mask_logits, boundary_logits
+        return mask
 
 
 def count_parameters(model: nn.Module) -> int:
@@ -188,10 +186,17 @@ def count_parameters(model: nn.Module) -> int:
 
 
 if __name__ == "__main__":
-    net = MicroFilNet()
-    print(f"Total Parameters: {count_parameters(net):,}")
+    # Test the model
+    model = FilamentSegmentation(in_channels=1, num_classes=1)
+    print(f"Total Parameters: {count_parameters(model):,}")
     
+    # Test with single channel input
     dummy_input = torch.randn(1, 1, 2048, 2048)
-    mask, boundary = net(dummy_input)
+    mask = model(dummy_input)
     print(f"Mask Logits Shape: {tuple(mask.shape)}")
-    print(f"Boundary Logits Shape: {tuple(boundary.shape)}")
+    
+    # Test with two channel input (raw + enhanced)
+    model_2ch = FilamentSegmentation(in_channels=2, num_classes=1)
+    dummy_2ch = torch.randn(1, 2, 2048, 2048)
+    mask_2ch = model_2ch(dummy_2ch)
+    print(f"Two-channel Mask Logits Shape: {tuple(mask_2ch.shape)}")

@@ -1,0 +1,64 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+# Solar Filament Segmentation Model - YOLO26 based architecture
+# Customized for 2048x2048 solar filament segmentation
+# Uses P2/P3/P4/P5 feature pyramid for full-image understanding
+
+# Parameters
+nc: 1 # number of classes (filament)
+scales: # model compound scaling constants
+  # [depth, width, max_channels]
+  n: [0.50, 0.25, 1024] # summary: 325 layers, 4,098,129 parameters
+  s: [0.50, 0.50, 1024] # summary: 325 layers, 16,392,516 parameters
+  m: [0.50, 1.00, 512] # summary: 345 layers, 32,785,032 parameters
+  l: [1.00, 1.00, 512] # summary: 457 layers, 65,570,064 parameters
+  x: [1.00, 1.50, 512] # summary: 457 layers, 147,532,644 parameters
+
+# Backbone - Solar Filament specific
+backbone:
+  # [from, repeats, module, args]
+  - [-1, 1, Conv, [32, 3, 2]] # 0-P1/2: 2048->1024
+  - [-1, 1, Conv, [64, 3, 2]] # 1-P2/4: 1024->512
+  - [-1, 1, C3k2, [64, False, 0.25]] # 2: C3k2 block
+  
+  - [-1, 1, Conv, [128, 3, 2]] # 3-P3/8: 512->256
+  - [-1, 1, C3k2, [128, False, 0.25]] # 4: C3k2 block
+  
+  - [-1, 1, Conv, [192, 3, 2]] # 5-P4/16: 256->128
+  - [-1, 1, C3k2, [192, False, 0.25]] # 6: C3k2 block
+  
+  - [-1, 1, Conv, [256, 3, 2]] # 7-P5/32: 128->64
+  - [-1, 1, C3k2, [256, True, 0.25]] # 8: C3k2 block
+  - [-1, 1, SPPF, [256, 5]] # 9: Spatial Pyramid Pooling
+
+# Neck - PANet for multi-scale fusion
+head:
+  # Top-down pathway
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 6], 1, Concat, [1]] # cat backbone P4
+  - [-1, 1, C3k2, [192, True, 0.25]] # 13: fused P4
+  
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 4], 1, Concat, [1]] # cat backbone P3
+  - [-1, 1, C3k2, [128, True, 0.25]] # 16: fused P3
+  
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 2], 1, Concat, [1]] # cat backbone P2
+  - [-1, 1, C3k2, [64, True, 0.25]] # 19: fused P2 (512x512)
+
+  # Bottom-up pathway
+  - [-1, 1, Conv, [64, 3, 2]]
+  - [[-1, 16], 1, Concat, [1]] # cat head P3
+  - [-1, 1, C3k2, [128, True, 0.25]] # 22: fused P3
+  
+  - [-1, 1, Conv, [128, 3, 2]]
+  - [[-1, 13], 1, Concat, [1]] # cat head P4
+  - [-1, 1, C3k2, [192, True, 0.25]] # 25: fused P4
+
+  # Segmentation head
+  - [19, 1, Conv, [16, 1, 1, 0]] # 26: reduce to prototype channels
+  - [26, 1, Conv, [16, 3, 1]] # 27: prototype refinement
+  - [27, 1, nn.Upsample, [None, 2, "bilinear"]] # 28: 512->1024
+  - [28, 1, Conv, [16, 3, 1]] # 29: refinement at 1024
+  - [29, 1, nn.Upsample, [None, 2, "bilinear"]] # 30: 1024->2048
+  - [30, 1, Conv, [1, 1, 1, 0]] # 31: final mask (2048x2048)
