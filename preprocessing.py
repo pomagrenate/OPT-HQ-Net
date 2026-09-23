@@ -73,6 +73,15 @@ def preprocess_halpha(raw_img: np.ndarray) -> tuple[np.ndarray, np.ndarray, tupl
     return enhanced.astype(np.float32), mask.astype(np.float32), (cx, cy, r_sun)
 
 
+# dataset.py imports `preprocess_halpha_fast` — it never existed as a separate
+# function, which made `import dataset` fail immediately. `preprocess_halpha`
+# is already the only (radial-flatten + CLAHE) pipeline, so we expose it under
+# both names. If you actually want a cheaper variant (e.g. skip CLAHE, or
+# subsample the radial profile) for speed during training, implement that here
+# and point this alias at it.
+preprocess_halpha_fast = preprocess_halpha
+
+
 def continuity_safe_augment(
     img: np.ndarray,
     gt: np.ndarray,

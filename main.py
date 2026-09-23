@@ -4,6 +4,8 @@ import argparse
 import os
 from pathlib import Path
 import cv2
+import matplotlib
+matplotlib.use("Agg")  # headless-safe: training runs on servers with no display
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -20,7 +22,6 @@ from dataset import SolarFilamentDataset, solar_collate_fn
 from inference import postprocess_mask, tiled_predict
 from losses import MicroFilNetLoss
 from model import MicroFilNet
-from preprocessing import preprocess_halpha
 from utils import (
     ModelEMA,
     binary_mask_to_rle,
@@ -36,7 +37,7 @@ def parse_args():
 
     train_parser = subparsers.add_parser("train")
     train_parser.add_argument("--data_root", type=str, required=True)
-    train_parser.add_argument("--use_cache", action="store_true", default=True)
+    train_parser.add_argument("--use_cache", action=argparse.BooleanOptionalAction, default=True)
     train_parser.add_argument("--tile_size", type=int, default=512)
     train_parser.add_argument("--overlap", type=float, default=0.25)
     train_parser.add_argument("--batch_size", type=int, default=4)
@@ -57,7 +58,7 @@ def parse_args():
     predict_parser = subparsers.add_parser("predict")
     predict_parser.add_argument("--weights", type=str, required=True)
     predict_parser.add_argument("--data_root", type=str, required=True)
-    predict_parser.add_argument("--use_cache", action="store_true", default=True)
+    predict_parser.add_argument("--use_cache", action=argparse.BooleanOptionalAction, default=True)
     predict_parser.add_argument("--tile_size", type=int, default=512)
     predict_parser.add_argument("--overlap", type=float, default=0.25)
     predict_parser.add_argument("--threshold", type=float, default=0.5)

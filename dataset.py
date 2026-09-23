@@ -39,6 +39,7 @@ class SolarFilamentDataset(Dataset):
         augment: bool = False,
         global_size: int = 512,
         transform: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
+        cache_limit: int = 16,
     ) -> None:
         super().__init__()
         self.data_root = Path(data_root)
@@ -50,6 +51,12 @@ class SolarFilamentDataset(Dataset):
         self.augment = augment and (self.split == 'train')
         self.global_size = global_size
         self.transform = transform
+        # In-memory cache of fully preprocessed (clean_img, valid_mask, disk_meta)
+        # keyed by file path. Each entry is a full-resolution float32 image
+        # (e.g. a 2048x2048 frame is ~16MB), so this is per-worker memory, not
+        # shared across DataLoader workers. Keep it modest, especially when
+        # num_workers > 1.
+        self.cache_limit = max(0, cache_limit)
 
         self.image_dir = self._resolve_image_dir()
         self.image_files = self._collect_image_files()
@@ -134,7 +141,10 @@ class SolarFilamentDataset(Dataset):
         if ext == '.npy':
             mmap = 'r' if self.use_mmap else None
             arr = np.load(path, mmap_mode=mmap)
-            return np.array(arr, dtype=np.float32, copy=False)
+            # np.asarray avoids a copy when arr is already float32 (as the
+            # mmap fast path relies on) but, unlike `np.array(..., copy=False)`,
+            # doesn't raise under numpy>=2.0 when a cast is actually needed.
+            return np.asarray(arr, dtype=np.float32)
 
         if ext in ('.fits', '.fit'):
             if not _HAS_ASTROPY:
@@ -191,7 +201,7 @@ class SolarFilamentDataset(Dataset):
             raise ValueError(f"Unexpected image shape {raw_arr.shape} at {path}")
 
         res = (clean_img, mask, meta)
-        if len(self._cache_store) < 60:
+        if len(self._cache_store) < self.cache_limit:
             self._cache_store[key] = res
         return res
 
