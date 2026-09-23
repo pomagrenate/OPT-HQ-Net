@@ -51,20 +51,8 @@ class SolarFilamentDataset(Dataset):
         self.use_mmap = use_mmap
         self.augment = augment and (self.split == 'train')
         self.global_size = global_size
-        # Fraction of tile_size added to EACH side of a tile's bounding box
-        # before it's used to sample the global context feature map (see
-        # model.spatial_align_crop). 0.5 means the model gets to see a
-        # window ~2x the tile's own footprint, centered on the tile — enough
-        # to pick up a filament that continues past the tile edge without
-        # blowing up compute. Must match what inference.tiled_predict uses,
-        # or train/inference context windows won't correspond.
         self.context_margin = context_margin
         self.transform = transform
-        # In-memory cache of fully preprocessed (clean_img, valid_mask, disk_meta)
-        # keyed by file path. Each entry is a full-resolution float32 image
-        # (e.g. a 2048x2048 frame is ~16MB), so this is per-worker memory, not
-        # shared across DataLoader workers. Keep it modest, especially when
-        # num_workers > 1.
         self.cache_limit = max(0, cache_limit)
 
         self.image_dir = self._resolve_image_dir()
@@ -150,9 +138,6 @@ class SolarFilamentDataset(Dataset):
         if ext == '.npy':
             mmap = 'r' if self.use_mmap else None
             arr = np.load(path, mmap_mode=mmap)
-            # np.asarray avoids a copy when arr is already float32 (as the
-            # mmap fast path relies on) but, unlike `np.array(..., copy=False)`,
-            # doesn't raise under numpy>=2.0 when a cast is actually needed.
             return np.asarray(arr, dtype=np.float32)
 
         if ext in ('.fits', '.fit'):
@@ -215,11 +200,6 @@ class SolarFilamentDataset(Dataset):
         return res
 
     def _tile_bbox_norm(self, ty: int, tx: int, h: int, w: int) -> np.ndarray:
-        """Context window for a tile at (ty, tx), padded by `context_margin`
-        on each side and expressed as a fraction of the full (h, w) frame.
-        Values may fall outside [0, 1] near the image border — that's fine,
-        `model.spatial_align_crop` uses border padding for out-of-range crops.
-        """
         margin_px = self.context_margin * self.tile_size
         x0 = (tx - margin_px) / float(w)
         y0 = (ty - margin_px) / float(h)
@@ -244,23 +224,22 @@ class SolarFilamentDataset(Dataset):
                 gt_mask = np.zeros((h, w), dtype=np.float32)
 
             polygons = self.img_to_polygons.get(img_path.name, [])
-            # Filament pixels are a tiny minority of any full-disk frame, so
-            # a purely random tile is usually filament-free. Biasing sampling
-            # toward filament-centered tiles (0.75 -> 0.85) means more of
-            # each epoch's gradient actually comes from positive pixels,
-            # which matters more now that masked_bce upweights them too —
-            # there's no point upweighting a signal that rarely appears.
-            sample_positive = (len(polygons) > 0) and (np.random.rand() < 0.85)
+            use_smart_roi = (len(polygons) > 0) and (np.random.rand() < 0.70)
 
-            if sample_positive and len(polygons) > 0:
+            if use_smart_roi:
                 chosen_poly = polygons[np.random.randint(len(polygons))]
-                poly_pts = np.array(chosen_poly).reshape(-1, 2)
-                target_x = int(poly_pts[:, 0].mean())
-                target_y = int(poly_pts[:, 1].mean())
+                pts = np.array(chosen_poly, dtype=np.float32).reshape(-1, 2)
+                min_x, min_y = pts.min(axis=0)
+                max_x, max_y = pts.max(axis=0)
 
-                margin = self.tile_size // 4
-                tx = target_x - self.tile_size // 2 + np.random.randint(-margin, margin + 1)
-                ty = target_y - self.tile_size // 2 + np.random.randint(-margin, margin + 1)
+                anchor_x = np.random.uniform(min_x, max_x)
+                anchor_y = np.random.uniform(min_y, max_y)
+
+                offset_x = np.random.uniform(0.15, 0.85) * self.tile_size
+                offset_y = np.random.uniform(0.15, 0.85) * self.tile_size
+
+                tx = int(anchor_x - offset_x)
+                ty = int(anchor_y - offset_y)
             else:
                 tx = np.random.randint(0, max(1, w - self.tile_size + 1))
                 ty = np.random.randint(0, max(1, h - self.tile_size + 1))
