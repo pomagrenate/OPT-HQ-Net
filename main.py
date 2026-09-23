@@ -20,7 +20,7 @@ from dataset import SolarFilamentDataset, solar_collate_fn
 from inference import postprocess_mask, tiled_predict
 from losses import MicroFilNetLoss
 from model import MicroFilNet
-from preprocessing import process_solar_observation
+from preprocessing import preprocess_halpha
 from utils import (
     ModelEMA,
     binary_mask_to_rle,
@@ -102,26 +102,19 @@ def save_full_disk_validation_plot(
             break
 
     raw_path = underlying_dataset.image_files[chosen_idx]
-    raw_img = underlying_dataset._read_image(raw_path)
+    clean_img, valid_mask, (cx, cy, r_sun) = underlying_dataset._get_processed_data(raw_path)
+    h, w = clean_img.shape
 
-    if raw_img.ndim == 3 and raw_img.shape[0] == 2:
-        image_stack = raw_img
-    else:
-        image_stack = process_solar_observation(raw_img)
+    image_stack = np.expand_dims(clean_img, axis=0)
+    valid_mask_stack = np.expand_dims(valid_mask, axis=0)
 
-    h, w = image_stack.shape[1], image_stack.shape[2]
-    cx, cy = w // 2, h // 2
-    r_sun = int(0.46 * min(h, w))
-    valid_mask = np.ones((1, h, w), dtype=np.float32)
-
-    global_img = cv2.resize(image_stack[0], (512, 512), interpolation=cv2.INTER_AREA)
-    global_ridge = cv2.resize(image_stack[1], (512, 512), interpolation=cv2.INTER_AREA)
-    global_stack = np.stack([global_img, global_ridge], axis=0).astype(np.float32)
+    global_img = cv2.resize(clean_img, (512, 512), interpolation=cv2.INTER_AREA)
+    global_stack = np.expand_dims(global_img, axis=0).astype(np.float32)
 
     prob_map = tiled_predict(
         model=model,
         image=image_stack,
-        valid_mask=valid_mask,
+        valid_mask=valid_mask_stack,
         global_image=global_stack,
         disk_center=(cx, cy, r_sun),
         tile=tile_size,
@@ -136,8 +129,8 @@ def save_full_disk_validation_plot(
         gt_mask = np.zeros((h, w), dtype=np.float32)
 
     fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-    axes[0].imshow(image_stack[0], cmap="magma")
-    axes[0].set_title(f"Processed Inverted H-alpha ({h}x{w})")
+    axes[0].imshow(clean_img, cmap="gray")
+    axes[0].set_title(f"H-alpha Normalized ({h}x{w})")
     axes[0].axis("off")
 
     axes[1].imshow(gt_mask, cmap="gray")

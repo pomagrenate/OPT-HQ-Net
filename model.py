@@ -67,19 +67,6 @@ class DecoderStage(nn.Module):
         return self.sca(self.refine(x))
 
 
-class RidgeFiLM(nn.Module):
-    def __init__(self, ch: int):
-        super().__init__()
-        self.proj = nn.Conv2d(1, 2 * ch, 1)
-        self.ch = ch
-
-    def forward(self, x: torch.Tensor, ridge_map: torch.Tensor) -> torch.Tensor:
-        ridge_small = F.interpolate(ridge_map, size=x.shape[-2:], mode="bilinear", align_corners=False)
-        gb = self.proj(ridge_small)
-        gamma, beta = gb[:, :self.ch], gb[:, self.ch:]
-        return x * (1.0 + torch.tanh(gamma)) + beta
-
-
 class LinearAttention2D(nn.Module):
     def __init__(self, dim: int, heads: int = 4):
         super().__init__()
@@ -88,9 +75,13 @@ class LinearAttention2D(nn.Module):
         self.to_qkv = nn.Conv2d(dim, dim * 3, 1, bias=False)
         self.to_out = nn.Conv2d(dim, dim, 1, bias=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, edge_bias: torch.Tensor | None = None) -> torch.Tensor:
         b, c, h, w = x.shape
         q, k, v = self.to_qkv(x).chunk(3, dim=1)
+        if edge_bias is not None:
+            q = q + edge_bias
+            k = k + edge_bias
+
         q = q.reshape(b, self.heads, self.dh, h * w).softmax(dim=2)
         k = k.reshape(b, self.heads, self.dh, h * w).softmax(dim=-1)
         v = v.reshape(b, self.heads, self.dh, h * w)
@@ -100,7 +91,7 @@ class LinearAttention2D(nn.Module):
 
 
 class TinyGlobalEncoder(nn.Module):
-    def __init__(self, in_ch: int = 2, out_ch: int = 128):
+    def __init__(self, in_ch: int = 1, out_ch: int = 128):
         super().__init__()
         self.net = nn.Sequential(
             nn.Conv2d(in_ch, 32, 3, stride=2, padding=1, bias=False),
@@ -124,25 +115,28 @@ class DilatedBottleneck(nn.Module):
         dilations = [1, 2, 4, 8] * (n_dilated_pairs // 4 + 1)
         dilations = dilations[:n_dilated_pairs]
         self.blocks = nn.ModuleList([DWSepConv(ch, ch, dilation=d) for d in dilations])
-        self.film = RidgeFiLM(ch)
+        self.edge_proj = nn.Conv2d(1, ch, 1, bias=False)
         self.attn1 = LinearAttention2D(ch)
         self.attn2 = LinearAttention2D(ch)
         self.norm1 = nn.GroupNorm(8, ch)
         self.norm2 = nn.GroupNorm(8, ch)
 
-    def forward(self, x: torch.Tensor, ridge_map: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, edge_map: torch.Tensor) -> torch.Tensor:
         for blk in self.blocks:
             x = x + blk(x)
-        x = self.film(x, ridge_map)
-        x = x + self.attn1(self.norm1(x))
-        x = x + self.attn2(self.norm2(x))
+
+        edge_small = F.interpolate(edge_map, size=x.shape[-2:], mode="bilinear", align_corners=False)
+        edge_bias = self.edge_proj(edge_small)
+
+        x = x + self.attn1(self.norm1(x), edge_bias)
+        x = x + self.attn2(self.norm2(x), edge_bias)
         return x
 
 
 class MicroFilNet(nn.Module):
     def __init__(
         self,
-        in_ch: int = 2,
+        in_ch: int = 1,
         stem_ch: int = 32,
         widths: tuple[int, ...] = (40, 64, 96, 128),
         bottleneck_ch: int = 160,
@@ -152,6 +146,11 @@ class MicroFilNet(nn.Module):
         n_dilated: int = 8,
     ):
         super().__init__()
+        self.edge_extractor = nn.Sequential(
+            nn.Conv2d(in_ch, 1, 3, padding=1),
+            nn.Sigmoid(),
+        )
+
         self.stem = DWSepConv(in_ch, stem_ch)
 
         enc_in = [stem_ch] + list(widths[:-1])
@@ -173,7 +172,7 @@ class MicroFilNet(nn.Module):
         dec_widths = list(reversed(widths))
         dec_in = [bottleneck_ch] + dec_widths[:-1]
         self.decoders = nn.ModuleList([
-            DecoderStage(ic, sc, sc, n_blocks_per_stage) for ic, sc in zip(dec_in, dec_widths)
+            DecoderStage(ic, sc, sc, n_blocks_per_stage) for ic, oc, sc in zip(dec_in, dec_widths, dec_widths)
         ])
 
         self.head = nn.Sequential(
@@ -188,7 +187,8 @@ class MicroFilNet(nn.Module):
         global_x: torch.Tensor,
         coords: torch.Tensor,
     ) -> torch.Tensor:
-        ridge_map = local_x[:, 1:2]
+        edge_map = self.edge_extractor(local_x)
+
         feat = self.stem(local_x)
         skips = []
         for enc in self.encoders:
@@ -203,7 +203,7 @@ class MicroFilNet(nn.Module):
 
         fused = torch.cat([feat, g_feat_expand, c_feat_expand], dim=1)
         fused = self.bottleneck_fuse(fused)
-        fused = self.bottleneck(fused, ridge_map)
+        fused = self.bottleneck(fused, edge_map)
 
         for dec, skip in zip(self.decoders, reversed(skips)):
             fused = dec(fused, skip)
@@ -214,14 +214,3 @@ class MicroFilNet(nn.Module):
 
 def count_parameters(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-
-if __name__ == "__main__":
-    model = MicroFilNet()
-    n = count_parameters(model)
-    print(f"MicroFilNet parameters: {n:,}")
-    local_sample = torch.randn(2, 2, 512, 512)
-    global_sample = torch.randn(2, 2, 512, 512)
-    coord_sample = torch.randn(2, 3)
-    out = model(local_sample, global_sample, coord_sample)
-    print(f"Output shape: {tuple(out.shape)}")

@@ -21,7 +21,7 @@ except ImportError:
 
 from preprocessing import (
     continuity_safe_augment,
-    process_solar_observation,
+    preprocess_halpha_fast,
 )
 
 
@@ -58,6 +58,7 @@ class SolarFilamentDataset(Dataset):
 
         self.img_to_polygons: Dict[str, List[List[float]]] = {}
         self.img_dimensions: Dict[str, Tuple[int, int]] = {}
+        self._cache_store: Dict[str, Tuple[np.ndarray, np.ndarray, Tuple[int, int, int]]] = {}
         if self.split == 'train':
             self._load_and_index_annotations()
 
@@ -170,30 +171,40 @@ class SolarFilamentDataset(Dataset):
 
         return mask.astype(np.float32)
 
+    def _get_processed_data(self, path: Path) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int, int]]:
+        key = str(path)
+        if key in self._cache_store:
+            return self._cache_store[key]
+
+        raw_arr = self._read_image(path)
+        if raw_arr.ndim == 3 and raw_arr.shape[0] == 1:
+            raw_arr = raw_arr[0]
+
+        if raw_arr.ndim == 2:
+            clean_img, mask, meta = preprocess_halpha_fast(raw_arr)
+        elif raw_arr.ndim == 3:
+            clean_img = raw_arr[0]
+            mask = np.ones_like(clean_img)
+            h, w = clean_img.shape
+            meta = (w // 2, h // 2, int(0.46 * min(h, w)))
+        else:
+            raise ValueError(f"Unexpected image shape {raw_arr.shape} at {path}")
+
+        res = (clean_img, mask, meta)
+        if len(self._cache_store) < 60:
+            self._cache_store[key] = res
+        return res
+
     def __len__(self) -> int:
         return len(self.image_files)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         img_path = self.image_files[idx]
-        raw_arr = self._read_image(img_path)
+        clean_img, valid_mask, (cx, cy, r_sun) = self._get_processed_data(img_path)
+        h, w = clean_img.shape
 
-        if raw_arr.ndim == 3 and raw_arr.shape[0] == 2:
-            image_stack = raw_arr
-            h, w = image_stack.shape[1], image_stack.shape[2]
-        elif raw_arr.ndim == 2:
-            h, w = raw_arr.shape
-            image_stack = process_solar_observation(raw_arr)
-        else:
-            raise ValueError(f"Unexpected image shape {raw_arr.shape} at {img_path}")
-
-        cx, cy = w // 2, h // 2
-        r_sun = int(0.46 * min(h, w))
-
-        global_img = cv2.resize(image_stack[0], (self.global_size, self.global_size), interpolation=cv2.INTER_AREA)
-        global_ridge = cv2.resize(image_stack[1], (self.global_size, self.global_size), interpolation=cv2.INTER_AREA)
-        global_stack = np.stack([global_img, global_ridge], axis=0).astype(np.float32)
-
-        valid_mask = np.ones((1, h, w), dtype=np.float32)
+        global_img = cv2.resize(clean_img, (self.global_size, self.global_size), interpolation=cv2.INTER_AREA)
+        global_tensor = torch.from_numpy(np.ascontiguousarray(global_img)).unsqueeze(0).float()
 
         if self.split == 'train':
             gt_mask = self._generate_mask(img_path.name, fallback_shape=(h, w))
@@ -219,8 +230,8 @@ class SolarFilamentDataset(Dataset):
             tx = int(np.clip(tx, 0, max(0, w - self.tile_size)))
             ty = int(np.clip(ty, 0, max(0, h - self.tile_size)))
 
-            img_tile = image_stack[:, ty : ty + self.tile_size, tx : tx + self.tile_size]
-            valid_tile = valid_mask[:, ty : ty + self.tile_size, tx : tx + self.tile_size]
+            img_tile = clean_img[ty : ty + self.tile_size, tx : tx + self.tile_size][np.newaxis, ...]
+            valid_tile = valid_mask[ty : ty + self.tile_size, tx : tx + self.tile_size][np.newaxis, ...]
             gt_tile = gt_mask[ty : ty + self.tile_size, tx : tx + self.tile_size]
             has_fil = bool(gt_tile.sum() > 0)
 
@@ -239,7 +250,7 @@ class SolarFilamentDataset(Dataset):
 
             sample: Dict[str, Any] = {
                 'image': torch.from_numpy(np.ascontiguousarray(img_tile)).float(),
-                'global_image': torch.from_numpy(np.ascontiguousarray(global_stack)).float(),
+                'global_image': global_tensor,
                 'coords': torch.from_numpy(coords).float(),
                 'valid_mask': torch.from_numpy(np.ascontiguousarray(valid_tile)).float(),
                 'mask': torch.from_numpy(np.ascontiguousarray(gt_tile)).float().unsqueeze(0),
@@ -248,14 +259,13 @@ class SolarFilamentDataset(Dataset):
                 'image_id': img_path.stem,
             }
         else:
-            disk_meta = (cx, cy, r_sun)
             sample = {
-                'image': torch.from_numpy(np.ascontiguousarray(image_stack)).float(),
-                'global_image': torch.from_numpy(np.ascontiguousarray(global_stack)).float(),
-                'valid_mask': torch.from_numpy(np.ascontiguousarray(valid_mask)).float(),
+                'image': torch.from_numpy(np.ascontiguousarray(clean_img[np.newaxis, ...])).float(),
+                'global_image': global_tensor,
+                'valid_mask': torch.from_numpy(np.ascontiguousarray(valid_mask[np.newaxis, ...])).float(),
                 'mask': None,
                 'image_id': img_path.stem,
-                'disk': disk_meta,
+                'disk': (cx, cy, r_sun),
             }
 
         if self.transform is not None:

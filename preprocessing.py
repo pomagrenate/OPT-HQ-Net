@@ -19,7 +19,7 @@ def fast_radial_flatten(
     cy: int,
     r: int,
     n_bins: int = 128,
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray]:
     h, w = img.shape
     yy, xx = np.ogrid[:h, :w]
     rr = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2) / max(float(r), 1.0)
@@ -30,7 +30,7 @@ def fast_radial_flatten(
     valid_pixels = img[disk_mask]
 
     if valid_pixels.size == 0:
-        return normalize_01(img)
+        return normalize_01(img), disk_mask.astype(np.float32)
 
     counts = np.bincount(valid_bins, minlength=n_bins)
     sums = np.bincount(valid_bins, weights=valid_pixels, minlength=n_bins)
@@ -51,43 +51,26 @@ def fast_radial_flatten(
 
     background_2d = profile_smooth[bin_idx]
     flattened = img / background_2d
+    median_val = float(np.median(valid_pixels)) if valid_pixels.size > 0 else 1.0
+    flattened *= median_val
     flattened[~disk_mask] = 0.0
-    return normalize_01(flattened)
+    return normalize_01(flattened), disk_mask.astype(np.float32)
 
 
-def enhance_dark_structures_and_edges(
-    img_flat: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    u8 = (np.clip(img_flat, 0.0, 1.0) * 255.0).astype(np.uint8)
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-    enhanced = clahe.apply(u8).astype(np.float32) / 255.0
-
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
-    closed = cv2.morphologyEx(u8, cv2.MORPH_CLOSE, kernel)
-    dark_tophat = np.clip(closed.astype(np.float32) - u8.astype(np.float32), 0.0, 255.0) / 255.0
-
-    grad_x = cv2.Sobel(u8, cv2.CV_32F, 1, 0, ksize=3)
-    grad_y = cv2.Sobel(u8, cv2.CV_32F, 0, 1, ksize=3)
-    edges = cv2.magnitude(grad_x, grad_y)
-    max_e = edges.max()
-    if max_e > 1e-6:
-        edges /= max_e
-
-    feature_channel = np.clip(1.0 - enhanced, 0.0, 1.0).astype(np.float32)
-    ridge_channel = np.clip(0.6 * dark_tophat + 0.4 * edges, 0.0, 1.0).astype(np.float32)
-
-    return feature_channel, ridge_channel
-
-
-def process_solar_observation(raw_img: np.ndarray) -> np.ndarray:
-    h, w = raw_img.shape[-2:]
+def preprocess_halpha(raw_img: np.ndarray) -> tuple[np.ndarray, np.ndarray, tuple[int, int, int]]:
+    h, w = raw_img.shape
     cx, cy = w // 2, h // 2
     r_sun = int(0.46 * min(h, w))
 
     norm = normalize_01(raw_img)
-    flattened = fast_radial_flatten(norm, cx, cy, r_sun)
-    feat, ridge = enhance_dark_structures_and_edges(flattened)
-    return np.stack([feat, ridge], axis=0).astype(np.float32)
+    flattened, mask = fast_radial_flatten(norm, cx, cy, r_sun)
+
+    u8 = (np.clip(flattened, 0.0, 1.0) * 255.0).astype(np.uint8)
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+    enhanced = clahe.apply(u8).astype(np.float32) / 255.0
+    enhanced[mask < 0.5] = 0.0
+
+    return enhanced.astype(np.float32), mask.astype(np.float32), (cx, cy, r_sun)
 
 
 def continuity_safe_augment(
