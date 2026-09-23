@@ -19,7 +19,7 @@ def soft_open(img: torch.Tensor) -> torch.Tensor:
     return soft_dilate(soft_erode(img))
 
 
-def soft_skeletonize(img: torch.Tensor, n_iter: int = 4) -> torch.Tensor:
+def soft_skeletonize(img: torch.Tensor, n_iter: int = 3) -> torch.Tensor:
     img1 = soft_open(img)
     skel = F.relu(img - img1)
     for _ in range(n_iter):
@@ -33,7 +33,7 @@ def soft_skeletonize(img: torch.Tensor, n_iter: int = 4) -> torch.Tensor:
 def soft_cl_dice(
     pred_prob: torch.Tensor,
     target: torch.Tensor,
-    n_iter: int = 4,
+    n_iter: int = 3,
     smooth: float = 1.0,
 ) -> torch.Tensor:
     skel_pred = soft_skeletonize(pred_prob, n_iter)
@@ -60,7 +60,7 @@ def masked_bce(
     logits: torch.Tensor,
     target: torch.Tensor,
     valid_mask: torch.Tensor,
-    pos_weight_val: float = 8.0,
+    pos_weight_val: float = 3.0,
 ) -> torch.Tensor:
     pw = torch.tensor([pos_weight_val], device=logits.device, dtype=logits.dtype)
     loss = F.binary_cross_entropy_with_logits(
@@ -72,8 +72,8 @@ def masked_bce(
 
 def cl_dice_weight_schedule(
     epoch: int,
-    warmup_epochs: int = 6,
-    target_weight: float = 0.3,
+    warmup_epochs: int = 12,
+    target_weight: float = 0.2,
 ) -> float:
     if epoch < warmup_epochs:
         return 0.0
@@ -86,11 +86,11 @@ class MicroFilNetLoss(nn.Module):
         self,
         w_bce: float = 1.0,
         w_dice: float = 1.0,
-        w_cldice_target: float = 0.3,
-        w_boundary: float = 0.2,
-        cldice_warmup_epochs: int = 6,
-        skel_iters: int = 4,
-        bce_pos_weight: float = 8.0,
+        w_cldice_target: float = 0.2,
+        w_boundary: float = 0.15,
+        cldice_warmup_epochs: int = 12,
+        skel_iters: int = 3,
+        bce_pos_weight: float = 3.0,
     ) -> None:
         super().__init__()
         self.w_bce = w_bce

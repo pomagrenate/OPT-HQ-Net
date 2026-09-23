@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 import cv2
 import matplotlib
-matplotlib.use("Agg")  # headless-safe: training runs on servers with no display
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -46,7 +46,7 @@ def parse_args():
     train_parser.add_argument("--lr", type=float, default=1e-4)
     train_parser.add_argument("--weight_decay", type=float, default=1e-5)
     train_parser.add_argument("--use_amp", action="store_true")
-    train_parser.add_argument("--grad_clip", type=float, default=5.0)
+    train_parser.add_argument("--grad_clip", type=float, default=2.0)
     train_parser.add_argument("--num_workers", type=int, default=2)
     train_parser.add_argument("--checkpoint_dir", type=str, default="checkpoints")
     train_parser.add_argument("--val_plot_dir", type=str, default=None)
@@ -184,7 +184,9 @@ def run_training(args):
     criterion = MicroFilNetLoss()
     raw_model = model.module if use_ddp else model
     optimizer = torch.optim.AdamW(raw_model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.5, patience=2, min_lr=1e-6
+    )
 
     ema = ModelEMA(raw_model, decay=args.ema_decay, device=device) if (args.use_ema and rank == 0) else None
     scaler = torch.amp.GradScaler("cuda") if (args.use_amp and device.type == "cuda") else None
@@ -334,9 +336,9 @@ def run_training(args):
             if use_ddp:
                 loss_tensor = torch.tensor([val_loss], device=device)
                 dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
-                current_loss = loss_tensor.item()
+                eval_loss = loss_tensor.item()
             else:
-                current_loss = val_loss
+                eval_loss = val_loss
 
             if rank == 0:
                 save_full_disk_validation_plot(
@@ -349,20 +351,18 @@ def run_training(args):
                     overlap=args.overlap,
                     context_margin=args.context_margin,
                 )
+        else:
+            eval_loss = current_loss
 
         train_loss = total_loss / max(n_batches, 1)
+        scheduler.step(eval_loss)
         lr_now = optimizer.param_groups[0]["lr"]
-        scheduler.step()
 
         if rank == 0:
-            # This print is intentionally NOT inside the tqdm bar (which
-            # closes with leave=False) so the per-epoch summary always stays
-            # in the log, even when this is piped to a file or a notebook
-            # that scrolls the live bar away.
             if val_loader is not None:
                 print(
                     f"[Epoch {epoch + 1}/{args.epochs}] "
-                    f"train_loss={train_loss:.4f} val_loss={current_loss:.4f} lr={lr_now:.2e}",
+                    f"train_loss={train_loss:.4f} val_loss={eval_loss:.4f} lr={lr_now:.2e}",
                     flush=True,
                 )
             else:
@@ -372,15 +372,15 @@ def run_training(args):
                     flush=True,
                 )
 
-            is_best = current_loss < best_loss
+            is_best = eval_loss < best_loss
             if is_best:
-                best_loss = current_loss
+                best_loss = eval_loss
 
             save_checkpoint(
                 model=raw_model,
                 optimizer=optimizer,
                 epoch=epoch,
-                loss=current_loss,
+                loss=eval_loss,
                 filepath=str(checkpoint_dir / "last.pt"),
                 ema_model=ema,
                 scheduler=scheduler,
@@ -391,7 +391,7 @@ def run_training(args):
                     model=raw_model,
                     optimizer=optimizer,
                     epoch=epoch,
-                    loss=current_loss,
+                    loss=eval_loss,
                     filepath=str(checkpoint_dir / "best_model.pt"),
                     ema_model=ema,
                     scheduler=scheduler,
@@ -402,7 +402,7 @@ def run_training(args):
                     model=raw_model,
                     optimizer=optimizer,
                     epoch=epoch,
-                    loss=current_loss,
+                    loss=eval_loss,
                     filepath=str(checkpoint_dir / f"checkpoint_epoch_{epoch + 1}.pt"),
                     ema_model=ema,
                     scheduler=scheduler,
