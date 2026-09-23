@@ -20,7 +20,7 @@ cv2.ocl.setUseOpenCL(False)
 
 from dataset import SolarFilamentDataset, solar_collate_fn
 from losses import MicroFilNetLoss
-from model import MicroFilNet
+from model import FilamentSegmentation as MicroFilNet
 from utils import (
     ModelEMA,
     binary_mask_to_rle,
