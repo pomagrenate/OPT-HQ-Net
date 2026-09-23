@@ -164,12 +164,45 @@ def spatial_align_crop(
     return F.grid_sample(feat_map, grid, mode="bilinear", padding_mode="border", align_corners=False)
 
 
+class StripPooling(nn.Module):
+    """Horizontal + vertical strip pooling (Hou et al., "Strip Pooling:
+    Rethinking Spatial Pooling for Scene Parsing", CVPR 2020).
+
+    A filament is a thin, elongated curve that can run most of the way
+    across a tile. Square convolution kernels (even dilated ones) see very
+    little of a filament's own length in one pass, so the network has to
+    stack many layers just to link up two ends of the same thin structure.
+    Strip pooling collapses the feature map along one axis at a time
+    (H -> a length-H column, W -> a length-W row), so a single 1x1 conv
+    already mixes information along the *entire* row/column a filament
+    might occupy, then broadcasts that context back out. It's a handful of
+    1x1 convs, so the parameter cost is tiny relative to the rest of the
+    model.
+    """
+
+    def __init__(self, ch: int):
+        super().__init__()
+        self.conv_h = nn.Conv2d(ch, ch, 1, bias=False)
+        self.conv_v = nn.Conv2d(ch, ch, 1, bias=False)
+        self.fuse = nn.Conv2d(ch, ch, 1, bias=False)
+        self.bn = nn.BatchNorm2d(ch)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h, w = x.shape[-2:]
+        x_h = self.conv_h(F.adaptive_avg_pool2d(x, (h, 1)))  # (B, C, H, 1)
+        x_v = self.conv_v(F.adaptive_avg_pool2d(x, (1, w)))  # (B, C, 1, W)
+        strip = self.fuse(x_h + x_v)  # broadcasts to (B, C, H, W)
+        gate = torch.sigmoid(self.bn(strip))
+        return x + x * gate
+
+
 class DilatedBottleneck(nn.Module):
     def __init__(self, ch: int, n_dilated_pairs: int = 4):
         super().__init__()
         dilations = [1, 2, 4, 8] * (n_dilated_pairs // 4 + 1)
         dilations = dilations[:n_dilated_pairs]
         self.blocks = nn.ModuleList([DWSepConv(ch, ch, dilation=d) for d in dilations])
+        self.strip_pool = StripPooling(ch)
         self.edge_proj = nn.Conv2d(1, ch, 1, bias=False)
         self.attn1 = LinearAttention2D(ch)
         self.attn2 = LinearAttention2D(ch)
@@ -179,6 +212,8 @@ class DilatedBottleneck(nn.Module):
     def forward(self, x: torch.Tensor, edge_map: torch.Tensor) -> torch.Tensor:
         for blk in self.blocks:
             x = x + blk(x)
+
+        x = self.strip_pool(x)
 
         edge_small = F.interpolate(edge_map, size=x.shape[-2:], mode="bilinear", align_corners=False)
         edge_bias = self.edge_proj(edge_small)
@@ -235,6 +270,16 @@ class MicroFilNet(nn.Module):
             nn.ReLU6(inplace=True),
             nn.Conv2d(8, 1, 1),
         )
+        # Filament pixels are a tiny fraction of a tile (well under 1%).
+        # With the default zero bias, an untrained head outputs sigmoid(x)
+        # near 0.5 everywhere, i.e. it starts by predicting most of the tile
+        # (or the whole disk) as filament — exactly the "predicts the whole
+        # sun" behavior seen in early epochs. Starting the bias low makes
+        # the untrained network's prior match the true class balance, so
+        # early training doesn't have to fight its way down from "everything
+        # is foreground" before it can start learning where filaments
+        # actually are.
+        nn.init.constant_(self.head[-1].bias, -4.0)
 
     def forward(
         self,

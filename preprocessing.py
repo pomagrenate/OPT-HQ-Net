@@ -57,6 +57,35 @@ def fast_radial_flatten(
     return normalize_01(flattened), disk_mask.astype(np.float32)
 
 
+def enhance_filament_contrast(
+    img: np.ndarray,
+    mask: np.ndarray,
+    kernel_size: int = 21,
+    alpha: float = 1.2,
+) -> np.ndarray:
+    """Darken thin, elongated filament structures relative to their
+    surroundings using a morphological black top-hat.
+
+    Filaments show up in H-alpha as dark, thread-like features on a
+    brighter chromospheric background. A black top-hat (closing(img) - img)
+    responds strongly to exactly this: dark features narrower than
+    `kernel_size` that are surrounded by brighter background, while leaving
+    broad, slowly-varying brightness (granulation, limb darkening residue)
+    largely untouched. Subtracting a scaled version of that response back
+    from the image increases the local contrast right where filaments are,
+    without a global contrast change that CLAHE alone can wash back out for
+    such a small minority class of pixels.
+    """
+    u8 = (np.clip(img, 0.0, 1.0) * 255.0).astype(np.uint8)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    blackhat = cv2.morphologyEx(u8, cv2.MORPH_BLACKHAT, kernel).astype(np.float32) / 255.0
+
+    boosted = img - alpha * blackhat
+    boosted = np.clip(boosted, 0.0, 1.0)
+    boosted[mask < 0.5] = 0.0
+    return boosted.astype(np.float32)
+
+
 def preprocess_halpha(raw_img: np.ndarray) -> tuple[np.ndarray, np.ndarray, tuple[int, int, int]]:
     h, w = raw_img.shape
     cx, cy = w // 2, h // 2
@@ -69,6 +98,8 @@ def preprocess_halpha(raw_img: np.ndarray) -> tuple[np.ndarray, np.ndarray, tupl
     clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
     enhanced = clahe.apply(u8).astype(np.float32) / 255.0
     enhanced[mask < 0.5] = 0.0
+
+    enhanced = enhance_filament_contrast(enhanced, mask)
 
     return enhanced.astype(np.float32), mask.astype(np.float32), (cx, cy, r_sun)
 

@@ -244,7 +244,13 @@ class SolarFilamentDataset(Dataset):
                 gt_mask = np.zeros((h, w), dtype=np.float32)
 
             polygons = self.img_to_polygons.get(img_path.name, [])
-            sample_positive = (len(polygons) > 0) and (np.random.rand() < 0.75)
+            # Filament pixels are a tiny minority of any full-disk frame, so
+            # a purely random tile is usually filament-free. Biasing sampling
+            # toward filament-centered tiles (0.75 -> 0.85) means more of
+            # each epoch's gradient actually comes from positive pixels,
+            # which matters more now that masked_bce upweights them too —
+            # there's no point upweighting a signal that rarely appears.
+            sample_positive = (len(polygons) > 0) and (np.random.rand() < 0.85)
 
             if sample_positive and len(polygons) > 0:
                 chosen_poly = polygons[np.random.randint(len(polygons))]

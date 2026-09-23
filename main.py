@@ -46,6 +46,7 @@ def parse_args():
     train_parser.add_argument("--lr", type=float, default=1e-4)
     train_parser.add_argument("--weight_decay", type=float, default=1e-5)
     train_parser.add_argument("--use_amp", action="store_true")
+    train_parser.add_argument("--grad_clip", type=float, default=5.0)
     train_parser.add_argument("--num_workers", type=int, default=2)
     train_parser.add_argument("--checkpoint_dir", type=str, default="checkpoints")
     train_parser.add_argument("--val_plot_dir", type=str, default=None)
@@ -291,10 +292,13 @@ def run_training(args):
 
             if args.use_amp and scaler is not None:
                 scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(raw_model.parameters(), max_norm=args.grad_clip)
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(raw_model.parameters(), max_norm=args.grad_clip)
                 optimizer.step()
 
             if ema is not None:
@@ -346,9 +350,28 @@ def run_training(args):
                     context_margin=args.context_margin,
                 )
 
+        train_loss = total_loss / max(n_batches, 1)
+        lr_now = optimizer.param_groups[0]["lr"]
         scheduler.step()
 
         if rank == 0:
+            # This print is intentionally NOT inside the tqdm bar (which
+            # closes with leave=False) so the per-epoch summary always stays
+            # in the log, even when this is piped to a file or a notebook
+            # that scrolls the live bar away.
+            if val_loader is not None:
+                print(
+                    f"[Epoch {epoch + 1}/{args.epochs}] "
+                    f"train_loss={train_loss:.4f} val_loss={current_loss:.4f} lr={lr_now:.2e}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[Epoch {epoch + 1}/{args.epochs}] "
+                    f"train_loss={train_loss:.4f} lr={lr_now:.2e}",
+                    flush=True,
+                )
+
             is_best = current_loss < best_loss
             if is_best:
                 best_loss = current_loss
